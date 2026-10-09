@@ -93,13 +93,29 @@ tgz 是**复制安装**：装完后 tgz 和源码目录都可以删掉，实际�
 
 ### C. 放到 GitHub 再装
 
-把目录推成仓库并打 tag 后：
+已发布仓库：<https://github.com/inuyama404/dsh-session-delete>（v0.1.1 release 附 tgz）。
+
+**方式 C1（需要对方装了 Git）**——pnpm 会先用 `git ls-remote` 解析 tag，所以本机没有 `git` 会直接失败：
 
 ```powershell
-& "...\dsh.cmd" plugin --profile desktop add "github:<用户名>/<仓库>#v0.1.1"
+& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "github:inuyama404/dsh-session-delete#v0.1.1"
 ```
 
-本插件没有 `prepare` 或任何构建脚本，所以不会触发 pnpm 的构建脚本审批流程。
+**方式 C2（不需要 Git，推荐给干净的机器）**——直接用 release 附件 URL：
+
+```powershell
+& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://github.com/inuyama404/dsh-session-delete/releases/download/v0.1.1/dsh-session-delete-0.1.1.tgz"
+```
+
+**方式 C3（不需要 Git）**——GitHub 的 tag 归档：
+
+```powershell
+& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://codeload.github.com/inuyama404/dsh-session-delete/tar.gz/refs/tags/v0.1.1"
+```
+
+C2 / C3 都在一次性 profile 里实测通过（装成真实目录、bundle 自动进 `dsh.profile.bundles`、装好的副本自检 32 项全过）；C1 在**没有 git** 的机器上实测失败（报 `git ls-remote` 找不到命令），装了 Git 的机器可用。本插件没有 `prepare` 或任何构建脚本，不会触发 pnpm 的构建脚本审批。
+
+**改完代码重新发布**：`publish-to-github.ps1`（工作区根目录）是幂等的——它读 token、必要时建仓库、按文件内容生成提交（内容没变就不提交）、发 release 并附 tgz、最后删除 token 文件。重新生成一个新 token 存到 `~/.dsh/gh-token.txt` 再跑一次即可。
 
 ### 换机器要注意什么
 
