@@ -1,0 +1,6 @@
+# Self-test scratch (created and removed by test/selftest.mjs)
+test/.sandbox/
+
+# Local packaging output
+*.tgz
+node_modules/
