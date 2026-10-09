@@ -1,0 +1,6 @@
+# Bundle patch for dsh-session-delete: insert the Host plugin row that serves
+# the delete route. The Client half comes from this package's dsh.client
+# declaration and its ./client export.
+- insert:
+    - id: session-delete
+      name: dsh-session-delete

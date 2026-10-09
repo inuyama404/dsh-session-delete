@@ -1,0 +1,38 @@
+{
+  "name": "dsh-session-delete",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Adds a Delete session action to the DSH sidebar session menu that really removes the session from disk.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "test"
+  ],
+  "scripts": {
+    "test": "node test/selftest.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-base": ">=0.2.0-rc.1 <0.3.0"
+  }
+}
