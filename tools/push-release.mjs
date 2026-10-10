@@ -4,24 +4,25 @@
  *
  * This machine has no `git` binary, and PowerShell's TLS stack cannot acquire
  * credentials (`schannel: SEC_E_NO_CREDENTIALS`), while Node's TLS works. So the
- * whole release runs over the GitHub Contents / Releases API:
+ * whole release runs over the GitHub Contents / Releases / Git Data APIs:
  *
- *   1. bump `version` in package.json and commit it to main
+ *   1. bump `package.json` AND README's release references, in ONE commit
  *   2. pack the tarball with the bundled pnpm
  *   3. create the release (which also creates the tag) and upload the tgz
- *   4. download the published asset back and compare SHA-256
+ *   4. verify the published asset against the local sha256
  *
- * Usage:  node tools/push-release.mjs 0.1.3
+ * Usage:  node tools/push-release.mjs 0.1.3     (from the repository root)
  * Token:  $env:DSH_GH_TOKEN  (fine-grained, this repo only, Contents: Read and write)
  *
- * Guards: the version is verified on main before the tag is created, an existing
- * tag/release aborts, and the asset is round-trip verified. Safe to re-run.
+ * Guards: README substitutions must all apply, an existing tag/release aborts,
+ * and a re-run where main is already at the target version is a clean no-op.
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
+import { bumpReadme } from './update-readme-version.mjs'
 
 const OWNER = 'inuyama404'
 const REPO = 'dsh-session-delete'
@@ -45,37 +46,86 @@ const buildDir = join(root, 'dist', `.build-${version}`)
 
 const step = (n, msg) => console.log(`\n[${n}] ${msg}`)
 
-// ---------------------------------------------------------------------------
-step(1, `bump package.json to ${version} and commit`)
-// ---------------------------------------------------------------------------
-const pkgApi = `${API}/contents/package.json`
-const getFile = async (url) => {
-  const r = await fetch(`${url}?ref=main&t=${Date.now()}`, { headers: auth })
-  if (!r.ok) throw new Error(`GET ${url} -> HTTP ${r.status}`)
+// This link to api.github.com is slow and occasionally times out (undici's default
+// is 10s and it does not retry), so give every call a longer budget and retry.
+const req = async (url, init = {}, attempts = 4) => {
+  let last
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const ctl = new AbortController()
+      const timer = setTimeout(() => ctl.abort(), 40000)
+      try {
+        return await fetch(url, { ...init, headers: { ...auth, ...(init.headers ?? {}) }, signal: ctl.signal })
+      } finally {
+        clearTimeout(timer)
+      }
+    } catch (error) {
+      last = error
+      const code = error?.cause?.code ?? error?.name ?? error?.message
+      console.log(`  retry ${i}/${attempts} after ${code}`)
+      if (i < attempts) await new Promise((r) => setTimeout(r, 1500 * i))
+    }
+  }
+  throw last
+}
+const getFile = async (path) => {
+  const r = await req(`${API}/contents/${path}?ref=main&t=${Date.now()}`)
+  if (!r.ok) throw new Error(`GET ${path} -> HTTP ${r.status}`)
   return r.json()
 }
-const pkgRes = await getFile(pkgApi)
+const postJson = async (url, body) => {
+  const r = await req(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  const j = await r.json()
+  if (!r.ok) throw new Error(`POST ${url} -> HTTP ${r.status} ${JSON.stringify(j)}`)
+  return j
+}
+
+// ---------------------------------------------------------------------------
+step(1, `bump package.json and README to ${version}, in one commit`)
+// ---------------------------------------------------------------------------
+const pkgRes = await getFile('package.json')
 const pkgText = Buffer.from(pkgRes.content, 'base64').toString('utf8')
 const current = JSON.parse(pkgText).version
+console.log(`  main is at ${current}`)
 
+let readmeBump = null
+let newPkgText = pkgText
 if (current !== version) {
   const anchor = `"version": "${current}",`
   if (pkgText.split(anchor).length - 1 !== 1) throw new Error(`version anchor not unique for ${current}`)
-  const bumped = pkgText.replace(anchor, `"version": "${version}",`)
-  const put = await fetch(pkgApi, {
-    method: 'PUT',
-    headers: { ...auth, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      message: `chore(release): ${version}`,
-      content: Buffer.from(bumped, 'utf8').toString('base64'),
-      sha: pkgRes.sha,
-      branch: 'main',
-    }),
+  newPkgText = pkgText.replace(anchor, `"version": "${version}",`)
+}
+
+if (current !== version) {
+  // README references must move with the version, or the install URLs rot.
+  const readmeRes = await getFile('README.md')
+  const readmeText = Buffer.from(readmeRes.content, 'base64').toString('utf8')
+  readmeBump = bumpReadme(readmeText, current, version)
+  console.log(`  README: ${readmeBump.applied.length} substitution(s) applied, ${readmeBump.skipped.length} already in sync`)
+  for (const l of readmeBump.applied) console.log(`    applied ${l}`)
+
+  const head = await (await req(`${API}/commits/main`)).json()
+  const parent = await (await req(`${API}/git/commits/${head.sha}`)).json()
+
+  const blobs = []
+  for (const [path, text] of [['package.json', newPkgText], ['README.md', readmeBump.text]]) {
+    const blob = await postJson(`${API}/git/blobs`, { content: Buffer.from(text, 'utf8').toString('base64'), encoding: 'base64' })
+    blobs.push({ path, mode: '100644', type: 'blob', sha: blob.sha })
+    console.log(`  blob ${path} -> ${blob.sha.slice(0, 12)}`)
+  }
+  const tree = await postJson(`${API}/git/trees`, { base_tree: parent.tree.sha, tree: blobs })
+  const commit = await postJson(`${API}/git/commits`, {
+    message: `chore(release): ${version}\n\nAlso repoints the README's release references, so the install commands,\nversion-gate example and /status sample never lag the published version.`,
+    tree: tree.sha,
+    parents: [head.sha],
   })
-  const out = await put.json()
-  if (!put.ok) throw new Error(`bump failed: HTTP ${put.status} ${JSON.stringify(out)}`)
-  console.log(`  ${current} -> ${version}`)
-  console.log(`  commit: ${out.commit.html_url}`)
+  const moved = await req(`${API}/git/refs/heads/main`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sha: commit.sha, force: false }),
+  })
+  if (!moved.ok) throw new Error(`ref update failed: HTTP ${moved.status}`)
+  console.log(`  commit: https://github.com/${OWNER}/${REPO}/commit/${commit.sha}`)
 } else {
   console.log(`  already at ${version}; nothing to commit`)
 }
@@ -86,10 +136,9 @@ step(2, 'pack the tarball with the bundled pnpm')
 rmSync(buildDir, { recursive: true, force: true })
 mkdirSync(buildDir, { recursive: true })
 const runtime = process.env.DSH_RUNTIME_DIR ?? 'D:/DeepSeek Harness/resources/runtime'
-const node = process.execPath
 const pnpm = join(runtime, 'pnpm', 'bin', 'pnpm.mjs')
 if (!existsSync(pnpm)) throw new Error(`bundled pnpm not found at ${pnpm}; set DSH_RUNTIME_DIR`)
-execFileSync(node, [pnpm, '--dir', root, 'pack', '--pack-destination', buildDir], { stdio: 'inherit' })
+execFileSync(process.execPath, [pnpm, '--dir', root, 'pack', '--pack-destination', buildDir], { stdio: 'inherit' })
 const tgz = join(buildDir, `dsh-session-delete-${version}.tgz`)
 if (!existsSync(tgz)) throw new Error(`pack did not produce ${tgz}`)
 const data = readFileSync(tgz)
@@ -100,14 +149,14 @@ console.log(`  ${data.length} bytes  sha256 ${sha256}`)
 // ---------------------------------------------------------------------------
 step(3, `create release ${tag} and upload the asset`)
 // ---------------------------------------------------------------------------
-const head = await (await fetch(`${API}/commits/main`, { headers: auth })).json()
+const head = await (await req(`${API}/commits/main`)).json()
 console.log(`  main HEAD: ${head.sha}`)
 
 // The tag must point at a tree that really declares this version.
-const verify = JSON.parse(Buffer.from((await getFile(pkgApi)).content, 'base64').toString('utf8'))
+const verify = JSON.parse(Buffer.from((await getFile('package.json')).content, 'base64').toString('utf8'))
 if (verify.version !== version) throw new Error(`main declares ${verify.version}, not ${version}`)
 
-const existing = await fetch(`${API}/releases/tags/${tag}`, { headers: auth })
+const existing = await req(`${API}/releases/tags/${tag}`)
 if (existing.status === 200) throw new Error(`release ${tag} already exists: ${(await existing.json()).html_url}`)
 
 const body = [
@@ -128,23 +177,22 @@ const body = [
   '```',
   `${sha256}  dsh-session-delete-${version}.tgz`,
   '```',
-  ``,
-  `已发布的 0.1.1 tarball 仍含该缺陷，装过 0.1.1 的人需要升级到本版。`,
 ].join('\n')
 
-const rel = await fetch(`${API}/releases`, {
-  method: 'POST',
-  headers: { ...auth, 'content-type': 'application/json' },
-  body: JSON.stringify({ tag_name: tag, target_commitish: head.sha, name: tag, body, draft: false, prerelease: false }),
+const relBody = await postJson(`${API}/releases`, {
+  tag_name: tag,
+  target_commitish: head.sha,
+  name: tag,
+  body,
+  draft: false,
+  prerelease: false,
 })
-const relBody = await rel.json()
-if (!rel.ok) throw new Error(`release POST failed: HTTP ${rel.status} ${JSON.stringify(relBody)}`)
 console.log(`  release: ${relBody.html_url}`)
 
 const assetName = `dsh-session-delete-${version}.tgz`
-const up = await fetch(`${relBody.upload_url.split('{')[0]}?name=${encodeURIComponent(assetName)}`, {
+const up = await req(`${relBody.upload_url.split('{')[0]}?name=${encodeURIComponent(assetName)}`, {
   method: 'POST',
-  headers: { ...HEADERS, authorization: `Bearer ${token}`, 'content-type': 'application/gzip', 'content-length': String(data.length) },
+  headers: { 'content-type': 'application/gzip', 'content-length': String(data.length) },
   body: data,
 })
 const upBody = await up.json()
@@ -156,12 +204,13 @@ step(4, 'verify the published asset')
 // ---------------------------------------------------------------------------
 // GitHub stores its own digest for release assets; prefer it, and only fall back
 // to downloading (github.com may be unreachable from a restricted network).
-const relCheck = await (await fetch(`${API}/releases/tags/${tag}`, { headers: auth })).json()
+const relCheck = await (await req(`${API}/releases/tags/${tag}`)).json()
 const asset = relCheck.assets.find((a) => a.name === assetName)
 const digest = asset?.digest?.replace(/^sha256:/, '')
 console.log(`  server-side digest: ${digest ?? '(none reported)'}`)
 console.log(`  local      sha256 : ${sha256}`)
-if (digest) console.log(`  MATCH: ${digest === sha256 ? 'YES' : 'NO'}`)
+if (digest && digest !== sha256) throw new Error('published asset digest does not match the local tarball')
+if (digest) console.log('  MATCH: YES')
 
 writeFileSync(join(buildDir, `${assetName}.sha256`), `${sha256}  ${assetName}\n`, 'utf8')
 console.log(`\ndone. ${relBody.html_url}`)

@@ -119,7 +119,7 @@ tgz 是**复制安装**：装完后 tgz 和源码目录都可以删掉，实际�
 
 ```powershell
 # 1) 改 package.json 的 version 并提交    2) 打包    3) 建 release 并把 tgz 作为附件上传
-& "D:\DeepSeek Harness\resources\runtime\bin\node.cmd" tools/push-release.mjs 0.1.3
+& "D:\DeepSeek Harness\resources\runtime\bin\node.cmd" tools/push-release.mjs x.y.z
 ```
 
 token 从 `$env:DSH_GH_TOKEN` 读取（细粒度、只授权本仓库的 Contents: Read and write 即可），用完请撤销。三条防呆：提交前核对 `package.json` 里确实是目标版本、已存在的 tag 直接拒绝、上传后回读附件比对 SHA-256。tag 由 release 创建时一并生成，因此本地不需要 git 仓库。

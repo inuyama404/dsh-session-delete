@@ -19,11 +19,11 @@
 
 | 脚本 | 作用 |
 |---|---|
-| `push-release.mjs <x.y.z>` | **一条命令发版**：改版本号并提交 → pnpm 打包 → 建 release（顺带建 tag）并上传附件 → 回读比对 SHA-256。从仓库根目录运行，读 `$env:DSH_GH_TOKEN`。 |
+| `push-release.mjs <x.y.z>` | **一条命令发版**：把 `package.json` 的版本号**和 README 的版本引用**放进**同一个提交** → pnpm 打包 → 建 release（顺带建 tag）并上传附件 → 回读比对 SHA-256。从仓库根目录运行，读 `$env:DSH_GH_TOKEN`。 |
+| `update-readme-version.mjs <old> <new> <in> <out>` | 单独改 README 的版本引用。也被 `push-release.mjs` 以 `import { bumpReadme }` 方式复用。每处替换都要求"恰好命中一次"；若 README 已指向**新**版本则视为已同步跳过（重跑是干净的 no-op），既不是旧版也不是新版才报错——所以不会静默错改，也不会重复提交空改动。 |
 | `bump-version.mjs <x.y.z>` | 只改 `package.json` 的 version 并提交（`push-release.mjs` 的第 1 步，单独用也行）。 |
 | `create-release.mjs <x.y.z> <tgz> <sha256>` | 只建 release 并上传附件（第 3 步）。 |
 | `commit-files.mjs <message> <manifest.json>` | 用 Git Data API 把多个文件**一次性**提交（blob → tree → commit → 移动 main ref），支持一次提交多文件。 |
-| `update-readme-version.mjs <old> <new> <in> <out>` | 把 README 里的发布版本引用整体改到新版本。每处替换都要求"恰好命中一次"，上游一动就会失败而不是误改。 |
 | `preflight.mjs` | **只读**预检：确认 token 身份、以及它对本仓库有没有写权限（看 `permissions.push`）。 |
 
 ## 校验
@@ -35,6 +35,19 @@
 | `verify-live.mjs <dir>` | 回读 `client.js` 与 `client.fixed.js` 比对（发布修复后确认线上内容）。 |
 | `verify-plugin-patch.mjs <client.js>` | 用 mock 的 cordis + React 跑插件客户端半侧，验证 `inject`、词典注册、slot 的 `locale` 选项，以及拿不到 locale 时的降级。 |
 | `diff-text.mjs <a> <b>` | 行级 diff（LCS），用于提交前审阅。 |
+
+### 测试
+
+`test-update-readme-version.mjs` 演练 `bumpReadme` 的五种情形，需要两个 fixture（**只在本机，
+未提交**）：当前 main 上的 `README.md`，以及修改前的 0.1.1 版 README。
+
+```powershell
+& "<DSH>\resources\runtime\bin\node.cmd" tools/test-update-readme-version.mjs <当前README> <0.1.1的README>
+```
+
+覆盖：正常升级（版本引用全部改掉、历史 `0.1.0` 保留、行数不变）、重跑为 no-op、版本不匹配时
+**大声失败**而不是改一半、0.1.1→0.1.2 的历史路径（`console.warn` 诊断只加一次）、以及发布示例
+不带会过期的具体版本号。
 
 ## 抓取与打包
 
