@@ -1,0 +1,41 @@
+diff --git a/client.js b/client.js
+--- a/client.js
++++ b/client.js
+@@ inject/disable-silent-english-fallback @@
+-    return {
+-      inject: ['slots'],
+-      apply(ctx) {
+-        let localised = false
+-        const locale = ctx.get?.('locale')
+-        if (locale !== undefined && typeof locale.register === 'function') {
+-          try {
+-            ctx.effect(() => locale.register(NS, DICTIONARIES), `${PLUGIN_ID}: dictionaries`)
+-            localised = true
+-          } catch {
+-            localised = false
+-          }
+-        }
++    return {
++      // 'locale' is required on purpose: the dictionary can only be registered
++      // once @deepseek-ai/dsh-client-locale has provided the service. Declaring
++      // it here makes the loader wait, instead of racing the provider and
++      // silently falling back to the built-in English table.
++      inject: ['slots', 'locale'],
++      apply(ctx) {
++        let localised = false
++        const locale = ctx.get?.('locale')
++        if (locale !== undefined && typeof locale.register === 'function') {
++          try {
++            ctx.effect(() => locale.register(NS, DICTIONARIES), `${PLUGIN_ID}: dictionaries`)
++            localised = true
++          } catch (error) {
++            console.warn(`[${PLUGIN_ID}] dictionary registration failed:`, error)
++          }
++        } else {
++          console.warn(`[${PLUGIN_ID}] locale service unavailable; continuing with the English fallback table`)
++        }
+-          `[dsh-session-delete] menu entry registered in ${SLOT}`
+-          + (primitives?.MenuItemButton === undefined ? ' (fallback row: primitives module unavailable)' : ''),
++          `[dsh-session-delete] menu entry registered in ${SLOT}`
++          + ` (locale: ${localised ? NS : 'english fallback'})`
++          + (primitives?.MenuItemButton === undefined ? ' (fallback row: primitives module unavailable)' : ''),
