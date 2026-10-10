@@ -226,7 +226,11 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots'],
+      // 'locale' is required on purpose: the dictionary can only be registered
+      // once @deepseek-ai/dsh-client-locale has provided the service. Declaring
+      // it here makes the loader wait, instead of racing the provider and
+      // silently falling back to the built-in English table.
+      inject: ['slots', 'locale'],
       apply(ctx) {
         let localised = false
         const locale = ctx.get?.('locale')
@@ -234,9 +238,11 @@ window.__ModuleLoader__.load({
           try {
             ctx.effect(() => locale.register(NS, DICTIONARIES), `${PLUGIN_ID}: dictionaries`)
             localised = true
-          } catch {
-            localised = false
+          } catch (error) {
+            console.warn(`[${PLUGIN_ID}] dictionary registration failed:`, error)
           }
+        } else {
+          console.warn(`[${PLUGIN_ID}] locale service unavailable; continuing with the English fallback table`)
         }
         ctx.slots.inject(SLOT, () => ctx.slots.register({
           name: SLOT,
@@ -249,6 +255,7 @@ window.__ModuleLoader__.load({
         // this page actually loaded the plugin bundle.
         console.info(
           `[dsh-session-delete] menu entry registered in ${SLOT}`
+          + ` (locale: ${localised ? NS : 'english fallback'})`
           + (primitives?.MenuItemButton === undefined ? ' (fallback row: primitives module unavailable)' : ''),
         )
       },
