@@ -64,7 +64,7 @@ DSH 会话删除插件：在侧边栏会话行的「⋯」菜单里增加一项 
 
 ### A. 用打包文件（推荐）
 
-`dist\dsh-session-delete-0.1.1.tgz` 是现成的单文件安装包（含 `index.js` / `client.js` / `cordis.patch.yml` / `package.json` / `README.md` / `test`）。改动源码后可以自己重打：
+`dist\dsh-session-delete-0.1.2.tgz` 是现成的单文件安装包（含 `index.js` / `client.js` / `cordis.patch.yml` / `package.json` / `README.md` / `test`）。改动源码后可以自己重打：
 
 ```powershell
 & "D:\DeepSeek Harness\resources\runtime\bin\node.cmd" "D:\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "<本目录>" pack --pack-destination "<输出目录>"
@@ -75,7 +75,7 @@ DSH 会话删除插件：在侧边栏会话行的「⋯」菜单里增加一项 
 1. **先打开一次 DeepSeek Harness 桌面客户端**（初始化 profile），然后**完全退出**；
 2. 把 tgz 拷过去，然后：
    ```powershell
-   & "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "D:\路径\dsh-session-delete-0.1.1.tgz"
+   & "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "D:\路径\dsh-session-delete-0.1.2.tgz"
    ```
 3. 重新打开客户端，会话行「⋯」菜单里出现「删除会话」即成功。
 
@@ -93,34 +93,41 @@ tgz 是**复制安装**：装完后 tgz 和源码目录都可以删掉，实际�
 
 ### C. 放到 GitHub 再装
 
-已发布仓库：<https://github.com/inuyama404/dsh-session-delete>（v0.1.1 release 附 tgz）。
+已发布仓库：<https://github.com/inuyama404/dsh-session-delete>（v0.1.2 release 附 tgz）。
 
 **方式 C1（需要对方装了 Git）**——pnpm 会先用 `git ls-remote` 解析 tag，所以本机没有 `git` 会直接失败：
 
 ```powershell
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "github:inuyama404/dsh-session-delete#v0.1.1"
+& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "github:inuyama404/dsh-session-delete#v0.1.2"
 ```
 
-**方式 C2（不需要 Git，推荐给干净的机器）**——直接用 release 附件 URL：
+**方式 C2（不需要 Git，新机器首选）**——直接用 release 附件 URL，一步到位：
 
 ```powershell
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://github.com/inuyama404/dsh-session-delete/releases/download/v0.1.1/dsh-session-delete-0.1.1.tgz"
+& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://github.com/inuyama404/dsh-session-delete/releases/download/v0.1.2/dsh-session-delete-0.1.2.tgz"
 ```
 
 **方式 C3（不需要 Git）**——GitHub 的 tag 归档：
 
 ```powershell
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://codeload.github.com/inuyama404/dsh-session-delete/tar.gz/refs/tags/v0.1.1"
+& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://codeload.github.com/inuyama404/dsh-session-delete/tar.gz/refs/tags/v0.1.2"
 ```
 
-C2 / C3 都在一次性 profile 里实测通过（装成真实目录、bundle 自动进 `dsh.profile.bundles`、装好的副本自检 32 项全过）；C1 在**没有 git** 的机器上实测失败（报 `git ls-remote` 找不到命令），装了 Git 的机器可用。本插件没有 `prepare` 或任何构建脚本，不会触发 pnpm 的构建脚本审批。
+**装到干净的机器上请用 C2**：一步到位，且不依赖 `git`。A 需要先拿到 tgz 文件，B 是 `link:` 安装（目录必须一直留着），C1 需要对方装了 Git（本机没有 git，实测报 `git ls-remote` 找不到命令），C3 拉的是 tag 归档而非发布附件。C2 / C3 都在一次性 profile 里实测通过（装成真实目录、bundle 自动进 `dsh.profile.bundles`、装好的副本自检 32 项全过）。本插件没有 `prepare` 或任何构建脚本，不会触发 pnpm 的构建脚本审批。
 
-**改完代码重新发布**：`publish-to-github.ps1`（工作区根目录）是幂等的——它读 token、必要时建仓库、按文件内容生成提交（内容没变就不提交）、发 release 并附 tgz、最后删除 token 文件。重新生成一个新 token 存到 `~/.dsh/gh-token.txt` 再跑一次即可。
+**改完代码重新发布**：走 GitHub Contents / Releases API，**不需要 `git`**。这台机器没有 `git`，PowerShell 的 TLS 栈也取不到凭据（`schannel: SEC_E_NO_CREDENTIALS`），而 Node 的 TLS 正常，所以 0.1.2 就是这么发的。
+
+```powershell
+# 1) 改 package.json 的 version 并提交    2) 打包    3) 建 release 并把 tgz 作为附件上传
+& "D:\DeepSeek Harness\resources\runtime\bin\node.cmd" tools/push-release.mjs 0.1.3
+```
+
+token 从 `$env:DSH_GH_TOKEN` 读取（细粒度、只授权本仓库的 Contents: Read and write 即可），用完请撤销。三条防呆：提交前核对 `package.json` 里确实是目标版本、已存在的 tag 直接拒绝、上传后回读附件比对 SHA-256。tag 由 release 创建时一并生成，因此本地不需要 git 仓库。
 
 ### 换机器要注意什么
 
 - **版本门槛**：插件声明 peer `@deepseek-ai/dsh-base >=0.2.0-rc.1 <0.3.0`。对方版本不在范围内时，`dsh plugin add` 会在安装前直接拒绝，并打印放行命令：
-  `dsh plugin --profile desktop allow-version dsh-session-delete@0.1.1 --dsh-version <对方运行时版本> --accept-risk`。
+  `dsh plugin --profile desktop allow-version dsh-session-delete@0.1.2 --dsh-version <对方运行时版本> --accept-risk`。
   这是官方的风险闸门（不兼容插件可能崩溃或损坏数据），放行前请确认插件的 API 在新版本里还在。对 0.1.x：`sessionPersistence.stat()` / `locate()` 可能不存在，代码里这两处都有兜底（拿不到 header 就按 `<home>/sessions/*/<会话id>` 扫描目录删除），但**未在 0.1.x 上实测**。
 - **profile 名要对**：桌面客户端装到 `--profile desktop`；若你在别处用 `dsh web` 启动，默认 profile 是 `web`，就装到 `web`。
 - **只适用于客户端/Web profile**：插件需要 `webServer`（注册路由）与 `sessionPersistence`；headless / ACP / SDK 这类没有 `webServer` 的 profile 里它会停在 `pending`，不会激活。
@@ -135,11 +142,12 @@ C2 / C3 都在一次性 profile 里实测通过（装成真实目录、bundle �
 2. **宿主半侧**（在任意 shell 里，不依赖客户端）：
    ```powershell
    curl.exe -sS http://127.0.0.1:19387/dsh-session-delete/status
-   # {"ok":true,"plugin":"dsh-session-delete","version":"0.1.1","workspaceRegistry":true}
+   # {"ok":true,"plugin":"dsh-session-delete","version":"0.1.2","workspaceRegistry":true}
    ```
    返回 404 说明当前进程里跑的还是 0.1.0（没有 status 路由，但删除功能正常）；`version` 会告诉你进程里到底是哪一份代码。
 3. **客户端控制台**（仅当你的客户端开放了开发者工具时才可用）：加载后应打印
-   `[dsh-session-delete] menu entry registered in sidebar.workspaces.session.menu.item`；
+   `[dsh-session-delete] menu entry registered in sidebar.workspaces.session.menu.item (locale: dsh-session-delete)`;
+   括号里若是 `(locale: english fallback)`，说明没拿到 `locale` 服务，菜单项会退回内置英文文案（同时会打印一条 `console.warn` 说明原因）。
    若末尾带 `(fallback row: primitives module unavailable)`，说明取不到 `@deepseek-ai/dsh-client-ui-primitives`，插件已降级为自绘按钮（功能不受影响）。本部署的 profile 里 `developerTools: false`，通常没有这个入口——那就以第 1 条为准。
 
 菜单里没有「删除会话」时：客户端内嵌界面支持重载就用 **Ctrl+R** 重载一次；不行就**完全退出并重开客户端**（重开会换到新的宿主代码，例如 `index.js` 改动后的版本）。
