@@ -40,8 +40,22 @@ export const inject = ['webServer', 'sessionPersistence']
 
 const ROUTE_PATH = '/dsh-session-delete/delete'
 const STATUS_PATH = '/dsh-session-delete/status'
+const PLAN_PATH = '/dsh-session-delete/plan'
+const BULK_PATH = '/dsh-session-delete/bulk-delete'
 /** Installed package version, read once so /status names the running code. */
 const PLUGIN_VERSION = readPluginVersion()
+
+/**
+ * Upper bound on one bulk request. Deletion is serial on the filesystem, so this
+ * also bounds how long a single response can be in flight; the client reports the
+ * remainder rather than issuing an unbounded request.
+ */
+const BULK_MAX = 200
+/**
+ * Budget for the persistence `list()` call behind the plan route. It is documented
+ * as unpaginated, so a large store must not be able to stall the route.
+ */
+const LIST_TIMEOUT_MS = 5000
 
 /** Read this package's version without depending on any service. */
 function readPluginVersion() {
@@ -72,6 +86,14 @@ export function apply(ctx) {
     'dsh-session-delete: delete route',
   )
   ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: PLAN_PATH, handler: createPlanHandler(ctx) }),
+    'dsh-session-delete: plan route',
+  )
+  ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: BULK_PATH, handler: createBulkHandler(ctx) }),
+    'dsh-session-delete: bulk delete route',
+  )
+  ctx.effect(
     () => ctx.webServer.register({
       kind: 'exact',
       path: STATUS_PATH,
@@ -81,12 +103,13 @@ export function apply(ctx) {
           plugin: 'dsh-session-delete',
           version: PLUGIN_VERSION,
           workspaceRegistry: ctx.get('workspaceRegistry') !== undefined,
+          bulk: { plan: PLAN_PATH, delete: BULK_PATH, maxPerRequest: BULK_MAX },
         })
       },
     }),
     'dsh-session-delete: status route',
   )
-  ctx.logger?.info?.(`[dsh-session-delete] ${PLUGIN_VERSION} ready: ${ROUTE_PATH}`)
+  ctx.logger?.info?.(`[dsh-session-delete] ${PLUGIN_VERSION} ready: ${ROUTE_PATH} (+ plan, bulk)`)
 }
 
 /**
@@ -124,6 +147,256 @@ function createHandler(ctx) {
       })
     }
   }
+}
+
+/**
+ * Build the HTTP handler for the bulk candidate list.
+ *
+ * The client cannot enumerate sessions (it only receives row identities), so the
+ * "select all" affordance needs this. Discovery prefers `list()` and falls back to
+ * scanning the artifact directories, so a build whose `list()` is missing or slow
+ * still yields candidates.
+ * @param ctx - Host plugin context.
+ * @returns the exact-route handler.
+ */
+function createPlanHandler(ctx) {
+  return async (request, response) => {
+    if (request.method !== 'POST' && request.method !== 'GET') {
+      respond(response, 405, { ok: false, error: 'method-not-allowed' })
+      return
+    }
+    try {
+      const sessions = await listCandidates(ctx)
+      respond(response, 200, {
+        ok: true,
+        maxPerRequest: BULK_MAX,
+        count: sessions.length,
+        sessions,
+      })
+    } catch (error) {
+      ctx.logger?.warn?.(`[dsh-session-delete] plan failed: ${errorMessage(error)}`)
+      respond(response, 500, { ok: false, error: 'plan-failed', message: errorMessage(error) })
+    }
+  }
+}
+
+/**
+ * Build the HTTP handler for a batch delete.
+ *
+ * Deletion is deliberately sequential: it touches the workspace registry and the
+ * filesystem per session, and a burst of parallel unlinks gives no benefit while
+ * making a partial failure harder to attribute. One session's failure never
+ * abandons the rest, and beyond {@link BULK_MAX} the remainder is reported back
+ * (`requested`/`deleted`/`results`) so the client can show it and ask again.
+ * @param ctx - Host plugin context.
+ * @returns the exact-route handler.
+ */
+function createBulkHandler(ctx) {
+  return async (request, response) => {
+    if (request.method !== 'POST') {
+      respond(response, 405, { ok: false, error: 'method-not-allowed' })
+      return
+    }
+    let body
+    try {
+      body = await readJsonBody(request)
+    } catch {
+      respond(response, 400, { ok: false, error: 'bad-request' })
+      return
+    }
+    if (!Array.isArray(body?.sessionIds)) {
+      respond(response, 400, { ok: false, error: 'bad-request', message: 'sessionIds must be an array' })
+      return
+    }
+
+    // Reject the whole request on a malformed id rather than silently dropping it:
+    // a partial delete would be worse than asking the client to resend valid ids.
+    const requested = []
+    const seen = new Set()
+    for (const raw of body.sessionIds) {
+      const id = typeof raw === 'string' ? raw.trim() : ''
+      if (!SESSION_ID_RE.test(id)) {
+        respond(response, 400, { ok: false, error: 'invalid-session-id', sessionId: typeof raw === 'string' ? raw.slice(0, 96) : null })
+        return
+      }
+      if (seen.has(id)) continue
+      seen.add(id)
+      requested.push(id)
+    }
+
+    const batch = requested.slice(0, BULK_MAX)
+    const results = []
+    let deleted = 0
+    for (const sessionId of batch) {
+      try {
+        const outcome = await deleteSession(ctx, sessionId)
+        if (outcome.ok) deleted += 1
+        results.push({
+          sessionId,
+          ok: outcome.ok === true,
+          status: outcome.status ?? (outcome.ok ? 200 : 500),
+          error: outcome.error,
+          removed: outcome.removed,
+          note: outcome.note,
+        })
+      } catch (error) {
+        ctx.logger?.warn?.(`[dsh-session-delete] bulk delete ${sessionId} failed: ${errorMessage(error)}`)
+        results.push({ sessionId, ok: false, status: 500, error: 'delete-failed', message: errorMessage(error) })
+      }
+    }
+
+    // A durable, greppable record of an irreversible operation.
+    ctx.logger?.info?.(
+      `[dsh-session-delete] bulk delete: ${deleted}/${batch.length} removed`
+      + ` (${results.filter((r) => !r.ok).map((r) => `${r.sessionId}:${r.error ?? 'error'}`).join(', ') || 'no failures'})`,
+    )
+
+    respond(response, 200, {
+      ok: deleted === batch.length,
+      requested: requested.length,
+      deleted,
+      failed: results.filter((r) => !r.ok).length,
+      remaining: Math.max(0, requested.length - batch.length),
+      maxPerRequest: BULK_MAX,
+      results,
+    })
+  }
+}
+
+/**
+ * List sessions that can be offered for bulk deletion.
+ * @param ctx - Host plugin context.
+ * @returns candidate rows in a stable order.
+ */
+async function listCandidates(ctx) {
+  const fromStore = await listFromStore(ctx)
+  if (fromStore.length > 0 || fromStore.available) return fromStore.rows
+  return listFromArtifacts(ctx)
+}
+
+/**
+ * Read candidates from the persistence service.
+ * @param ctx - Host plugin context.
+ * @returns `{ available, rows }`; `available` is false when `list()` could not run.
+ */
+async function listFromStore(ctx) {
+  const persistence = ctx.sessionPersistence
+  if (typeof persistence?.list !== 'function') return { available: false, rows: [] }
+  let snapshots
+  try {
+    snapshots = await withTimeout(Promise.resolve(persistence.list()), LIST_TIMEOUT_MS)
+  } catch (error) {
+    ctx.logger?.warn?.(`[dsh-session-delete] session list unavailable: ${errorMessage(error)}`)
+    return { available: false, rows: [] }
+  }
+  if (!Array.isArray(snapshots)) return { available: false, rows: [] }
+
+  const owners = ownershipIndex(ctx)
+  const rows = []
+  for (const snapshot of snapshots) {
+    const header = snapshot?.header ?? snapshot
+    const id = typeof header?.id === 'string' ? header.id : ''
+    if (!SESSION_ID_RE.test(id)) continue
+    rows.push(candidateView(id, header, owners))
+  }
+  rows.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.sessionId.localeCompare(b.sessionId))
+  return { available: true, rows }
+}
+
+/**
+ * Fall back to the artifact directories when the store cannot enumerate.
+ * @param ctx - Host plugin context.
+ * @returns candidate rows in a stable order.
+ */
+async function listFromArtifacts(ctx) {
+  const home = dshHome(ctx)
+  const root = join(home, 'sessions')
+  if (!existsSync(root)) return []
+  const owners = ownershipIndex(ctx)
+  const rows = []
+  let workspaces
+  try {
+    workspaces = await readdir(root, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  for (const workspace of workspaces) {
+    if (!workspace.isDirectory()) continue
+    let entries
+    try {
+      entries = await readdir(join(root, workspace.name), { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !SESSION_ID_RE.test(entry.name)) continue
+      rows.push(candidateView(entry.name, undefined, owners))
+    }
+  }
+  rows.sort((a, b) => a.sessionId.localeCompare(b.sessionId))
+  return rows
+}
+
+/**
+ * Project one candidate row for the client.
+ * @param id - Session id.
+ * @param header - Stored header, when the store supplied one.
+ * @param owners - Workspace ownership index.
+ * @returns the wire representation.
+ */
+function candidateView(id, header, owners) {
+  const owner = owners.get(id)
+  return {
+    sessionId: id,
+    title: typeof header?.title === 'string' ? header.title : undefined,
+    createdAt: typeof header?.createdAt === 'number' ? header.createdAt : undefined,
+    archived: owner?.archived === true,
+    // Presence only: the client cannot ask the agent registry itself.
+    active: owner?.active === true || (header?.archived === true),
+  }
+}
+
+/**
+ * Map session id to its workspace entry, to surface archived state.
+ * @param ctx - Host plugin context.
+ * @returns id → `{ archived, active }`.
+ */
+function ownershipIndex(ctx) {
+  const index = new Map()
+  const registry = ctx.get('workspaceRegistry')
+  if (registry === undefined) return index
+  let workspaces
+  try {
+    workspaces = registry.list()
+  } catch {
+    return index
+  }
+  if (!Array.isArray(workspaces)) return index
+  for (const workspace of workspaces) {
+    const archivedIds = Array.isArray(workspace.archivedSessionIds) ? workspace.archivedSessionIds : []
+    const sessionIds = Array.isArray(workspace.sessionIds) ? workspace.sessionIds : []
+    for (const id of sessionIds) index.set(id, { archived: archivedIds.includes(id), active: false })
+    for (const id of archivedIds) index.set(id, { archived: true, active: false })
+  }
+  return index
+}
+
+/**
+ * Reject after `ms` when `promise` has not settled, so a slow `list()` cannot make
+ * the plan route hang.
+ * @param promise - Work to bound.
+ * @param ms - Budget in milliseconds.
+ * @returns the promise's value.
+ */
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
+      // Do not keep the process alive just for this timer.
+      timer.unref?.()
+    }),
+  ])
 }
 
 /**

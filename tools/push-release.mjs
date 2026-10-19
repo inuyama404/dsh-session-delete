@@ -136,8 +136,16 @@ step(2, 'pack the tarball with the bundled pnpm')
 rmSync(buildDir, { recursive: true, force: true })
 mkdirSync(buildDir, { recursive: true })
 const runtime = process.env.DSH_RUNTIME_DIR ?? 'D:/DeepSeek Harness/resources/runtime'
-const pnpm = join(runtime, 'pnpm', 'bin', 'pnpm.mjs')
-if (!existsSync(pnpm)) throw new Error(`bundled pnpm not found at ${pnpm}; set DSH_RUNTIME_DIR`)
+// The bundled pnpm has moved between DSH releases: try both layouts.
+const pnpmCandidates = [
+  join(runtime, 'pnpm', 'bin', 'pnpm.mjs'),
+  join(runtime, 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'),
+]
+const pnpm = pnpmCandidates.find((candidate) => existsSync(candidate))
+if (pnpm === undefined) {
+  throw new Error(`bundled pnpm not found (tried ${pnpmCandidates.join(', ')}); set DSH_RUNTIME_DIR`)
+}
+console.log(`  pnpm: ${pnpm}`)
 execFileSync(process.execPath, [pnpm, '--dir', root, 'pack', '--pack-destination', buildDir], { stdio: 'inherit' })
 const tgz = join(buildDir, `dsh-session-delete-${version}.tgz`)
 if (!existsSync(tgz)) throw new Error(`pack did not produce ${tgz}`)

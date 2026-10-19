@@ -30,7 +30,11 @@ window.__ModuleLoader__.load({
 
     const PLUGIN_ID = 'dsh-session-delete'
     const SLOT = 'sidebar.workspaces.session.menu.item'
+    const LEADING_SLOT = 'sidebar.session.row.leading'
+    const OVERLAY_SLOT = 'shell.overlay'
     const ROUTE = '/dsh-session-delete/delete'
+    const BULK_ROUTE = '/dsh-session-delete/bulk-delete'
+    const PLAN_ROUTE = '/dsh-session-delete/plan'
     const NS = 'dsh-session-delete'
     const MAX_TITLE = 22
 
@@ -45,6 +49,34 @@ window.__ModuleLoader__.load({
         'reason.active': '会话仍有进行中的工作',
         'reason.missing': '会话不存在',
         'reason.network': '无法连接宿主',
+        'bulk.enter': '批量删除会话…',
+        'bulk.selected': '已选 {count} 个会话',
+        'bulk.selectAll': '全选',
+        'bulk.clear': '清空',
+        'bulk.cancel': '取消',
+        'bulk.delete': '删除 {count} 个会话',
+        'bulk.confirm': '确认删除 {count} 个？',
+        'bulk.deleting': '正在删除 {done}/{total}…',
+        'bulk.done': '已删除 {deleted} 个',
+        'bulk.someFailed': '已删除 {deleted} 个，{failed} 个失败',
+        'bulk.none': '未选中任何会话',
+        'bulk.empty': '没有可删除的会话',
+        'bulk.loading': '正在读取会话列表…',
+        'bulk.remain': '还有 {left} 个未处理，可再点一次',
+        'bulk.reload': '刷新页面以更新列表',
+        'bulk.select': '选择「{title}」',
+        'bulk.selectN': '选择会话 {id}',
+        'row.select': '加入待删列表',
+        'row.unselect': '移出待删列表',
+        'row.current': '当前会话不能删除',
+        'row.currentShort': '当前会话',
+        'bar.delete': '删除选中的 {count} 个会话',
+        'bar.done': '已删除 {deleted} 个',
+        'bar.partial': '已删除 {deleted} 个，{failed} 个失败',
+        'confirm.title': '确认删除 {count} 个会话？',
+        'confirm.body': '会话记录会从磁盘上永久删除，无法恢复。',
+        'confirm.cancel': '取消',
+        'confirm.ok': '确认删除',
       },
       en: {
         'menu.delete': 'Delete session',
@@ -56,6 +88,34 @@ window.__ModuleLoader__.load({
         'reason.active': 'the session still has running work',
         'reason.missing': 'no such session',
         'reason.network': 'cannot reach the host',
+        'bulk.enter': 'Delete multiple sessions…',
+        'bulk.selected': '{count} selected',
+        'bulk.selectAll': 'Select all',
+        'bulk.clear': 'Clear',
+        'bulk.cancel': 'Cancel',
+        'bulk.delete': 'Delete {count} sessions',
+        'bulk.confirm': 'Really delete {count}?',
+        'bulk.deleting': 'Deleting {done}/{total}…',
+        'bulk.done': 'Deleted {deleted}',
+        'bulk.someFailed': 'Deleted {deleted}, {failed} failed',
+        'bulk.none': 'No session selected',
+        'bulk.empty': 'Nothing to delete',
+        'bulk.loading': 'Reading sessions…',
+        'bulk.remain': '{left} left; run it again',
+        'bulk.reload': 'Reload the page to refresh the list',
+        'bulk.select': 'Select "{title}"',
+        'bulk.selectN': 'Select session {id}',
+        'row.select': 'Add to delete list',
+        'row.unselect': 'Remove from delete list',
+        'row.current': "The open session can't be deleted",
+        'row.currentShort': 'open session',
+        'bar.delete': 'Delete {count} selected sessions',
+        'bar.done': 'Deleted {deleted}',
+        'bar.partial': 'Deleted {deleted}, {failed} failed',
+        'confirm.title': 'Delete {count} sessions?',
+        'confirm.body': 'The session logs are removed from disk permanently. This cannot be undone.',
+        'confirm.cancel': 'Cancel',
+        'confirm.ok': 'Delete',
       },
     }
 
@@ -104,6 +164,258 @@ window.__ModuleLoader__.load({
       }
       if (!response.ok || payload?.ok !== true) throw new Error(reasonText(payload, response.status))
       return payload
+    }
+
+    /**
+     * Send a batch to the Host. Resolves with the host payload for any HTTP 200,
+     * including partial successes; a transport or protocol failure throws.
+     */
+    async function postBatch(sessionIds) {
+      let response
+      try {
+        response = await fetch(BULK_ROUTE, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionIds }),
+        })
+      } catch {
+        throw new Error(FALLBACK_TEXT['reason.network'])
+      }
+      let payload = null
+      try {
+        payload = await response.json()
+      } catch {
+        payload = null
+      }
+      if (!response.ok) throw new Error(reasonText(payload, response.status))
+      if (payload === null || !Array.isArray(payload.results)) throw new Error(`HTTP ${String(response.status)}`)
+      return payload
+    }
+
+    /** Fetch the deletable-session list the Host offers for "select all". */
+    async function fetchPlan() {
+      let response
+      try {
+        response = await fetch(PLAN_ROUTE, { method: 'GET' })
+      } catch {
+        throw new Error(FALLBACK_TEXT['reason.network'])
+      }
+      let payload = null
+      try {
+        payload = await response.json()
+      } catch {
+        payload = null
+      }
+      if (!response.ok || payload?.ok !== true || !Array.isArray(payload.sessions)) {
+        throw new Error(reasonText(payload, response.status))
+      }
+      return payload
+    }
+
+    /**
+     * Session id → the checkbox wrapper element rendered inside that row.
+     *
+     * Rows are keyed by session, so this doubles as a live index of "where each
+     * session is on screen". The currently open session is the one whose row
+     * carries the host's `_selected` class; reading it live (rather than caching a
+     * value) means switching sessions cannot leave a stale id behind.
+     */
+    const rowRegistry = new Map()
+
+    /**
+     * The session currently open in the UI, or null when it cannot be determined.
+     *
+     * The class is hashed per build (`…_sessionRow …_selected`), so it is matched by
+     * suffix. A wrong guess only ever removes protection from the UI; `run()`
+     * re-checks before sending, so it is re-evaluated at the moment of deletion.
+     */
+    function currentSessionId() {
+      for (const [id, element] of rowRegistry) {
+        const row = element?.closest?.('[class*="_selected"]')
+        if (row !== null && row !== undefined && /row/i.test(String(row.className))) return id
+      }
+      return null
+    }
+
+    /**
+     * Bulk-selection state shared by every surface (row checkboxes, the bulk menu
+     * row, the action bar). The client's slot model hands each row only its own
+     * `{ sessionId }`, so the selection cannot live in a component: it lives here,
+     * is published as a client service in `apply`, and every surface subscribes
+     * through the same snapshot.
+     *
+     * The snapshot is immutable and only replaced on real changes, so
+     * `useSyncExternalStore` can compare it by identity.
+     * @param options.resolveCurrent - returns the open session id, or null.
+     */
+    function createSelectionStore(options = {}) {
+      let resolveCurrent = typeof options.resolveCurrent === 'function' ? options.resolveCurrent : () => null
+      let snapshot = Object.freeze({
+        active: false,
+        selected: Object.freeze([]),
+        busy: false,
+        phase: 'idle',
+        plan: null,
+        planError: '',
+        result: null,
+        done: 0,
+        // True when the batch had to drop the session currently being viewed.
+        skippedCurrent: false,
+      })
+      const listeners = new Set()
+      const set = (next) => {
+        snapshot = Object.freeze({ ...snapshot, ...next })
+        for (const listener of listeners) listener()
+      }
+      const has = (id) => snapshot.selected.includes(id)
+
+      return {
+        subscribe(listener) {
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
+        getSnapshot: () => snapshot,
+        /** Internal: replace the open-session resolver (used by tests and by apply). */
+        setCurrentResolver(fn) {
+          resolveCurrent = typeof fn === 'function' ? fn : () => null
+        },
+        /** Enter selection mode, clearing any previous batch. */
+        activate() {
+          set({ active: true, selected: [], phase: 'idle', result: null, done: 0, planError: '', plan: null })
+        },
+        /** Leave selection mode. Refuses while a delete is in flight. */
+        deactivate() {
+          if (snapshot.busy) return false
+          set({ active: false, selected: [], phase: 'idle', result: null, done: 0 })
+          return true
+        },
+        toggle(sessionId) {
+          if (!snapshot.active || snapshot.busy) return
+          const next = has(sessionId)
+            ? snapshot.selected.filter((id) => id !== sessionId)
+            : [...snapshot.selected, sessionId]
+          set({ selected: next, phase: 'idle', result: null })
+        },
+        selectMany(ids) {
+          if (!snapshot.active || snapshot.busy) return
+          // The session being viewed is never a candidate, not even via "select all".
+          const open = resolveCurrent()
+          const seen = new Set(snapshot.selected)
+          for (const id of ids) {
+            if (id === open) continue
+            seen.add(id)
+          }
+          set({ selected: [...seen], phase: 'idle', result: null })
+        },
+        clear() {
+          if (snapshot.busy) return
+          set({ selected: [], phase: 'idle', result: null })
+        },
+        begin() {
+          if (snapshot.busy || snapshot.selected.length === 0) return false
+          set({ phase: 'armed' })
+          return true
+        },
+        /** Leave the confirmation step but keep the selection. */
+        cancel() {
+          if (snapshot.busy) return
+          set({ phase: 'idle' })
+        },
+        /** Load the host-side candidate list, used by "select all". */
+        async loadPlan() {
+          if (snapshot.plan !== null || snapshot.busy) return snapshot.plan
+          set({ planError: '' })
+          try {
+            const payload = await fetchPlan()
+            set({ plan: payload })
+            return payload
+          } catch (error) {
+            set({ planError: error instanceof Error ? error.message : String(error) })
+            return null
+          }
+        },
+        /**
+         * Delete the current selection in one host round trip (the host caps the
+         * batch and reports the remainder).
+         *
+         * On a clean run the selection mode closes itself, so the checkboxes go away
+         * with the rows. A partial run keeps only the refused sessions selected, so
+         * a running or busy session is still actionable instead of silently surviving
+         * a batch that looked like it succeeded.
+         *
+         * The session being viewed is filtered out here, immediately before the
+         * request, rather than trusting the UI to have excluded it.
+         */
+        async run() {
+          if (snapshot.busy || snapshot.selected.length === 0) return null
+          const open = resolveCurrent()
+          const ids = snapshot.selected.filter((id) => id !== open)
+          if (ids.length === 0) {
+            // Only the open session was selected: nothing may be deleted.
+            set({ phase: 'idle', selected: [], skippedCurrent: true })
+            return null
+          }
+          set({ busy: true, phase: 'running', done: 0, result: null, skippedCurrent: ids.length !== snapshot.selected.length })
+          try {
+            const payload = await postBatch(ids)
+            // The host archives each session before deleting it, so the rows hide
+            // themselves; the bar only has to report the outcome. The cached plan
+            // is stale now, so "select all" re-fetches.
+            const refused = Array.isArray(payload.results)
+              ? payload.results.filter((row) => row.ok !== true).map((row) => row.sessionId)
+              : []
+            if (refused.length === 0) {
+              set({
+                active: false,
+                selected: [],
+                busy: false,
+                phase: 'done',
+                result: payload,
+                done: payload.deleted ?? 0,
+                plan: null,
+              })
+            } else {
+              set({
+                busy: false,
+                phase: 'failed',
+                result: payload,
+                done: payload.deleted ?? 0,
+                selected: refused,
+                plan: null,
+              })
+            }
+            return payload
+          } catch (error) {
+            set({
+              busy: false,
+              phase: 'failed',
+              result: { ok: false, deleted: 0, failed: ids.length, results: [], message: error instanceof Error ? error.message : String(error) },
+              // Keep the ids so the user can retry after a transport failure.
+              selected: ids,
+            })
+            return null
+          }
+        },
+      }
+    }
+
+    /**
+     * The shared selection store, created in `apply`. It is a module-level binding
+     * so every slot component reads the same instance.
+     */
+    let selection = null
+
+    /**
+     * Subscribe a component to the shared store. Returns a null state when the store
+     * is absent, so a component can render nothing rather than throwing.
+     */
+    function useSelection() {
+      const store = selection
+      if (store === null) return { state: null, store: null }
+      // The store's presence is fixed for the page's lifetime, so hook order is stable.
+      // eslint-disable-next-line react-hooks/rules-of-hooks
+      const state = React.useSyncExternalStore(store.subscribe, store.getSnapshot)
+      return { state, store }
     }
 
     /** Shorten a title so the armed row stays readable in the menu. */
@@ -171,8 +483,12 @@ window.__ModuleLoader__.load({
       const setMenuOpen = typeof menuState?.[1] === 'function' ? menuState[1] : () => {}
       const [phase, setPhase] = React.useState('idle')
       const [reason, setReason] = React.useState('')
+      // The session being viewed is protected here too: deleting it leaves the page
+      // sitting in a session that no longer exists.
+      const isOpen = currentSessionId() === sessionId
 
       const onSelect = React.useCallback(() => {
+        if (isOpen) return
         if (phase === 'busy' || phase === 'done') return
         if (phase !== 'armed') {
           setReason('')
@@ -193,11 +509,12 @@ window.__ModuleLoader__.load({
             setReason(message)
             setPhase('failed')
           })
-      }, [phase, run, sessionId, setMenuOpen])
+      }, [isOpen, phase, run, sessionId, setMenuOpen])
 
       const title = shorten(displayTitle)
       let label
-      if (phase === 'armed') label = translate('menu.confirm', { title: title === '' ? sessionId : title })
+      if (isOpen) label = translate('row.current')
+      else if (phase === 'armed') label = translate('menu.confirm', { title: title === '' ? sessionId : title })
       else if (phase === 'busy') label = translate('menu.busy')
       else if (phase === 'done') label = translate('menu.done')
       else if (phase === 'failed') label = translate('menu.failed', { reason })
@@ -206,24 +523,427 @@ window.__ModuleLoader__.load({
       const icon = primitives?.IconTrashOutlineRegular === undefined
         ? undefined
         : h(primitives.IconTrashOutlineRegular, { size: 14 })
+      const disabled = isOpen || phase === 'busy' || phase === 'done'
 
       if (primitives?.MenuItemButton !== undefined) {
         return h(primitives.MenuItemButton, {
-          danger: true,
+          danger: !isOpen,
           separatorBefore: true,
           icon,
-          disabled: phase === 'busy' || phase === 'done',
+          disabled,
           onSelect,
         }, label)
       }
       return fallbackRow({
         children: label,
         icon,
-        danger: true,
-        disabled: phase === 'busy' || phase === 'done',
+        danger: !isOpen,
+        disabled,
         onSelect,
       })
     }
+
+    /** Shared styling for the bulk surfaces, using only documented theme tokens. */
+    const TOKENS = {
+      danger: 'var(--dsw-alias-state-error-primary, #d34)',
+      label: 'var(--dsw-alias-label-primary, inherit)',
+      secondary: 'var(--dsw-alias-label-secondary, #666)',
+      border: 'var(--dsw-alias-border-secondary, rgba(128,128,128,0.35))',
+      surface: 'var(--dsw-alias-bg-elevated, #fff)',
+      radius: 'var(--dsw-radius-md, 8px)',
+    }
+
+    /**
+     * A plugin must never be able to take a host surface down with it.
+     *
+     * Every slot entry is wrapped in an error boundary: if a render throws, only
+     * that entry disappears (rendering null) and one warning names it in the
+     * console. Without this, a single bad render inside a session row can blank the
+     * whole session list.
+     *
+     * The class is created lazily on purpose: `class X extends React.Component`
+     * evaluates when the bundle is materialized, so a missing `Component` export
+     * would throw there and take the entire plugin down before anything renders.
+     */
+    let SurfaceBoundary = null
+    function surfaceBoundary() {
+      if (SurfaceBoundary !== null) return SurfaceBoundary
+      if (typeof React.Component !== 'function') return null
+      SurfaceBoundary = class extends React.Component {
+        constructor(props) {
+          super(props)
+          this.state = { failed: false }
+        }
+
+        static getDerivedStateFromError() {
+          return { failed: true }
+        }
+
+        componentDidCatch(error) {
+          console.warn(`[${PLUGIN_ID}] surface "${this.props.surface}" failed to render:`, error)
+        }
+
+        render() {
+          return this.state.failed ? null : this.props.children
+        }
+      }
+      return SurfaceBoundary
+    }
+
+    /**
+     * Wrap a slot component so a throw degrades to "this entry renders nothing".
+     *
+     * If the host's React exposes no `Component` class the wrapper cannot exist, so
+     * the raw component is returned instead: the guard is a safety net, never a
+     * hard dependency (a `class extends undefined` would throw while the bundle is
+     * still being evaluated, taking the plugin down with it).
+     * @param surface - entry id, used in the console warning.
+     * @param Component - the real slot component.
+     * @returns a guarded component of the same shape.
+     */
+    function guarded(surface, Component) {
+      const Boundary = surfaceBoundary()
+      if (Boundary === null) return Component
+      return function GuardedSurface(props) {
+        return h(Boundary, { surface }, h(Component, props))
+      }
+    }
+
+    /**
+     * One menu row that enters or leaves selection mode.
+     *
+     * It is registered on the same slot as the single delete row, so it inherits
+     * the menu plumbing that already works, and it stays reachable for running and
+     * archived sessions (whose `row.leading` slot is suppressed).
+     */
+    function BulkMenuMenuItem(props) {
+      const { useMenuOpenState, t } = props
+      const translate = typeof t === 'function' ? t : (key, values) => format(FALLBACK_TEXT[key] ?? key, values)
+      const { state, store } = useSelection()
+      const menuState = typeof useMenuOpenState === 'function' ? useMenuOpenState() : undefined
+      const setMenuOpen = typeof menuState?.[1] === 'function' ? menuState[1] : () => {}
+      if (state === null || store === null) return null
+
+      const onSelect = () => {
+        setMenuOpen(false)
+        if (state.active) store.deactivate()
+        else store.activate()
+      }
+
+      const label = state.active ? translate('bulk.cancel') : translate('bulk.enter')
+      const icon = primitives?.IconChecklistOutlineRegular === undefined
+        ? undefined
+        : h(primitives.IconChecklistOutlineRegular, { size: 14 })
+
+      if (primitives?.MenuItemButton !== undefined) {
+        return h(primitives.MenuItemButton, {
+          separatorBefore: !state.active,
+          icon,
+          onSelect,
+        }, label)
+      }
+      return fallbackRow({ children: label, icon, danger: false, disabled: false, onSelect })
+    }
+
+    /**
+     * The per-row checkbox, registered into `sidebar.session.row.leading`.
+     *
+     * That slot only renders for neither-archived nor status-dot rows, so an
+     * archived or currently running session has no checkbox: those are reachable
+     * through the row menu instead, and the host refuses a running one anyway.
+     *
+     * Events are stopped so arming a row never opens the session or starts the
+     * row's drag reorder. `click` is NOT default-prevented: the row is draggable
+     * and the checkbox lives inside it, and cancelling the click's default action
+     * suppresses the checkbox's own activation (onChange never fires).
+     */
+    function BulkRowCheckbox(props) {
+      const { sessionId, displayTitle, t } = props
+      const translate = typeof t === 'function' ? t : (key, values) => format(FALLBACK_TEXT[key] ?? key, values)
+      const { state, store } = useSelection()
+      const [tick, setTick] = React.useState(0)
+      const active = state !== null && store !== null && state.active
+
+      // A ref callback runs when the element actually appears, which matters
+      // because this component only renders its box once selection mode starts.
+      // The element is kept (hidden) while inactive so the single-delete row can
+      // still tell whether it belongs to the open session.
+      const attach = React.useCallback((element) => {
+        if (element === null) {
+          rowRegistry.delete(sessionId)
+          return
+        }
+        rowRegistry.set(sessionId, element)
+        // The element only exists now, so the render that produced it could not
+        // have known whether this row is the open one: ask for one more render.
+        setTick((value) => value + 1)
+      }, [sessionId])
+
+      // "Which row is selected" is host state we cannot subscribe to, and the row
+      // does not re-render when the user switches sessions. A coarse tick while
+      // selection mode is on keeps the checkbox honest; the value that decides an
+      // actual deletion is re-read at confirm time regardless.
+      React.useEffect(() => {
+        if (!active) return undefined
+        const timer = setInterval(() => setTick((value) => value + 1), 500)
+        return () => clearInterval(timer)
+      }, [active])
+
+      if (state === null || store === null) return null
+
+      // The session being viewed can never be part of a delete batch.
+      const isOpen = currentSessionId() === sessionId
+      void tick
+
+      if (!active) {
+        // Hidden anchor only: keeps the row discoverable without occupying space.
+        return h('span', {
+          ref: attach,
+          style: { display: 'none' },
+          'aria-hidden': true,
+          'data-session-id': sessionId,
+        })
+      }
+
+      const checked = state.selected.includes(sessionId) && !isOpen
+      const title = shorten(displayTitle)
+      const label = isOpen
+        ? translate('row.current')
+        : (title === ''
+            ? translate('bulk.selectN', { id: sessionId })
+            : translate('bulk.select', { title }))
+      const keep = (event) => event.stopPropagation()
+
+      return h('span', {
+        ref: attach,
+        'data-session-id': sessionId,
+        style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '16px', height: '16px' },
+        onClick: keep,
+        onDoubleClick: keep,
+        onPointerDown: keep,
+        onMouseDown: keep,
+        onDragStart: (event) => {
+          // Do not let the row's drag-reorder start from the checkbox.
+          event.stopPropagation()
+          event.preventDefault()
+        },
+        title: label,
+      }, h('input', {
+        type: 'checkbox',
+        checked,
+        disabled: state.busy || isOpen,
+        'aria-label': label,
+        onChange: () => store.toggle(sessionId),
+        style: {
+          width: '13px',
+          height: '13px',
+          margin: 0,
+          cursor: state.busy || isOpen ? 'not-allowed' : 'pointer',
+          accentColor: TOKENS.danger,
+          opacity: isOpen ? 0.4 : 1,
+        },
+      }))
+    }
+
+    /**
+     * The bulk action: a red button anchored under the session list, plus a
+     * confirmation dialog.
+     *
+     * Registered into `shell.overlay`, the frame-wide overlay layer the layout
+     * package renders as `position:absolute; inset:0; pointer-events:none` with
+     * `pointer-events:auto` on its direct children. Anchoring with `left`/`bottom`
+     * puts the button at the bottom of the sidebar — visually under the last session
+     * row — without needing to measure anything.
+     *
+     * Renders nothing unless selection mode is on and at least one session is
+     * selected.
+     */
+    function BulkBar(props) {
+      const { t } = props
+      const translate = typeof t === 'function' ? t : (key, values) => format(FALLBACK_TEXT[key] ?? key, values)
+      const { state, store } = useSelection()
+
+      if (state === null || store === null) return null
+      if (!state.active || state.selected.length === 0) return null
+
+      const count = state.selected.length
+      const busy = state.busy
+      const result = state.result
+      const failed = result?.failed ?? 0
+      const deleted = result?.deleted ?? 0
+
+      let status = ''
+      if (state.phase === 'done' || state.phase === 'failed') {
+        status = failed > 0
+          ? translate('bar.partial', { deleted, failed })
+          : translate('bar.done', { deleted })
+        if ((result?.remaining ?? 0) > 0) status += ` · ${translate('bulk.remain', { left: result.remaining })}`
+        if (result?.ok === false && failed === 0 && typeof result?.message === 'string') status = result.message
+      }
+
+      const button = h('button', {
+        key: 'action',
+        type: 'button',
+        disabled: busy,
+        title: translate('bulk.enter'),
+        onClick: () => {
+          if (!busy) store.begin()
+        },
+        style: {
+          position: 'absolute',
+          left: '8px',
+          bottom: '8px',
+          width: 'calc(var(--dsh-windows-sidebar-width, 260px) - 16px)',
+          padding: '8px 10px',
+          border: `1px solid ${TOKENS.danger}`,
+          borderRadius: TOKENS.radius,
+          background: TOKENS.danger,
+          color: 'var(--dsw-alias-label-on-error, #fff)',
+          fontSize: '13px',
+          fontWeight: 600,
+          lineHeight: '18px',
+          cursor: busy ? 'not-allowed' : 'pointer',
+          opacity: busy ? 0.6 : 1,
+          pointerEvents: 'auto',
+          boxShadow: '0 4px 14px rgba(0,0,0,0.18)',
+        },
+      }, busy
+        ? translate('bulk.deleting', { done: 0, total: count })
+        : translate('bar.delete', { count }))
+
+      const note = status === ''
+        ? null
+        : h('div', {
+          key: 'note',
+          style: {
+            position: 'absolute',
+            left: '8px',
+            bottom: '46px',
+            width: 'calc(var(--dsh-windows-sidebar-width, 260px) - 16px)',
+            padding: '4px 8px',
+            borderRadius: '6px',
+            background: TOKENS.surface,
+            border: `1px solid ${failed > 0 ? TOKENS.danger : TOKENS.border}`,
+            color: failed > 0 ? TOKENS.danger : TOKENS.secondary,
+            fontSize: '11px',
+            lineHeight: '16px',
+            pointerEvents: 'none',
+          },
+        }, status)
+
+      if (state.phase !== 'armed') return h('div', null, [button, note])
+
+      // Two-step confirmation, as a real dialog rather than a label change.
+      const dialog = h('div', {
+        key: 'confirm-backdrop',
+        style: {
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: 'rgba(0,0,0,0.35)',
+          pointerEvents: 'auto',
+        },
+      }, h('div', {
+        role: 'dialog',
+        'aria-modal': 'true',
+        style: {
+          width: 'min(360px, calc(100vw - 48px))',
+          padding: '16px',
+          borderRadius: TOKENS.radius,
+          background: TOKENS.surface,
+          border: `1px solid ${TOKENS.border}`,
+          boxShadow: '0 16px 40px rgba(0,0,0,0.24)',
+          color: TOKENS.label,
+          fontSize: '13px',
+          lineHeight: '20px',
+        },
+      }, [
+        h('div', {
+          key: 'title',
+          style: { fontWeight: 600, marginBottom: '8px' },
+        }, translate('confirm.title', { count })),
+        h('div', {
+          key: 'body',
+          style: { color: TOKENS.secondary, marginBottom: '14px' },
+        }, translate('confirm.body')),
+        h('div', {
+          key: 'actions',
+          style: { display: 'flex', justifyContent: 'flex-end', gap: '8px' },
+        }, [
+          h('button', {
+            key: 'cancel',
+            type: 'button',
+            onClick: () => store.cancel(),
+            style: {
+              border: `1px solid ${TOKENS.border}`,
+              borderRadius: '6px',
+              background: 'transparent',
+              color: TOKENS.label,
+              padding: '4px 12px',
+              fontSize: '12px',
+              cursor: 'pointer',
+            },
+          }, translate('confirm.cancel')),
+          h('button', {
+            key: 'ok',
+            type: 'button',
+            onClick: () => store.run(),
+            style: {
+              border: `1px solid ${TOKENS.danger}`,
+              borderRadius: '6px',
+              background: TOKENS.danger,
+              color: 'var(--dsw-alias-label-on-error, #fff)',
+              padding: '4px 12px',
+              fontSize: '12px',
+              fontWeight: 600,
+              cursor: 'pointer',
+            },
+          }, translate('confirm.ok')),
+        ]),
+      ]))
+
+      return h('div', null, [button, note, dialog])
+    }
+
+    /**
+     * A per-row menu entry that toggles selection for *this* session.
+     *
+     * It exists because `sidebar.session.row.leading` is suppressed for archived
+     * rows and for rows showing a live status dot, which would otherwise be
+     * unselectable. While selection mode is on it is the reliable path for every row;
+     * it disappears when the mode is off.
+     */
+    function BulkRowMenuItem(props) {
+      const { sessionId, displayTitle, useMenuOpenState, t } = props
+      const translate = typeof t === 'function' ? t : (key, values) => format(FALLBACK_TEXT[key] ?? key, values)
+      const { state, store } = useSelection()
+      const menuState = typeof useMenuOpenState === 'function' ? useMenuOpenState() : undefined
+      const setMenuOpen = typeof menuState?.[1] === 'function' ? menuState[1] : () => {}
+      if (state === null || store === null || !state.active) return null
+
+      const checked = state.selected.includes(sessionId)
+      const onSelect = () => {
+        store.toggle(sessionId)
+        setMenuOpen(false)
+      }
+      const title = shorten(displayTitle)
+      const label = checked ? translate('row.unselect') : translate('row.select')
+      const icon = checked && primitives?.IconCheckOutlineRegular !== undefined
+        ? h(primitives.IconCheckOutlineRegular, { size: 14 })
+        : undefined
+
+      if (primitives?.MenuItemButton !== undefined) {
+        return h(primitives.MenuItemButton, {
+          icon,
+          disabled: state.busy,
+          onSelect,
+        }, label)
+      }
+      return fallbackRow({ children: label, icon, danger: false, disabled: state.busy, onSelect })
+    }
+
 
     return {
       // 'locale' is required on purpose: the dictionary can only be registered
@@ -244,19 +964,80 @@ window.__ModuleLoader__.load({
         } else {
           console.warn(`[${PLUGIN_ID}] locale service unavailable; continuing with the English fallback table`)
         }
-        ctx.slots.inject(SLOT, () => ctx.slots.register({
-          name: SLOT,
+
+        // One store for every surface: rows only receive their own session id, so
+        // the selection cannot live inside a component. The "open session" resolver
+        // is read live from the row registry, and re-read right before deleting.
+        selection = createSelectionStore({ resolveCurrent: currentSessionId })
+        try {
+          ctx.provide('sessionDeleteSelection', selection)
+        } catch (error) {
+          // The service is a convenience for other plugins; losing it must not stop
+          // this one from registering its own surfaces.
+          console.warn(`[${PLUGIN_ID}] could not publish the selection service:`, error)
+        }
+        ctx.effect(() => () => {
+          selection?.deactivate()
+          selection = null
+        }, `${PLUGIN_ID}: selection store`)
+
+        const localeOption = localised ? { locale: NS } : {}
+
+        /**
+         * Register one slot entry, isolating failures. A surface that cannot
+         * register is skipped and named in the console; the others still load.
+         */
+        const mount = (label, slot, config, Component) => {
+          try {
+            ctx.slots.inject(slot, () => ctx.slots.register({ name: slot, ...config }, Component))
+          } catch (error) {
+            console.warn(`[${PLUGIN_ID}] could not register "${label}":`, error)
+          }
+        }
+
+        mount('delete-session', SLOT, {
           id: `${PLUGIN_ID}.delete-session`,
           order: 500,
-          ...(localised ? { locale: NS } : {}),
+          ...localeOption,
           inject: () => ({ deleteSession }),
-        }, DeleteSessionMenuItem))
+        }, guarded('delete-session', DeleteSessionMenuItem))
+
+        // 'locale' here is what turned the bulk row English: without it the slot
+        // hands the component no `t` seat and every label falls back to the
+        // built-in English table.
+        mount('bulk-mode', SLOT, {
+          id: `${PLUGIN_ID}.bulk-mode`,
+          order: 450,
+          ...localeOption,
+        }, guarded('bulk-mode', BulkMenuMenuItem))
+
+        // Second, always-available way to select one session: the row's leading
+        // slot is suppressed for archived and status-dot rows.
+        mount('row-select', SLOT, {
+          id: `${PLUGIN_ID}.row-select`,
+          order: 460,
+          ...localeOption,
+        }, guarded('row-select', BulkRowMenuItem))
+
+        mount('row-checkbox', LEADING_SLOT, {
+          id: `${PLUGIN_ID}.row-checkbox`,
+          order: 100,
+          ...localeOption,
+        }, guarded('row-checkbox', BulkRowCheckbox))
+
+        // The frame-wide overlay seat: no row transform/overflow can capture it.
+        mount('bulk-bar', OVERLAY_SLOT, {
+          id: `${PLUGIN_ID}.bulk-bar`,
+          order: 100,
+          ...localeOption,
+        }, guarded('bulk-bar', BulkBar))
+
         // Visible in the page console (F12): the quickest way to tell whether
         // this page actually loaded the plugin bundle.
         console.info(
-          `[dsh-session-delete] menu entry registered in ${SLOT}`
+          `[dsh-session-delete] bulk surfaces registered: ${SLOT} (menu), ${LEADING_SLOT} (checkbox), ${OVERLAY_SLOT} (bar)`
           + ` (locale: ${localised ? NS : 'english fallback'})`
-          + (primitives?.MenuItemButton === undefined ? ' (fallback row: primitives module unavailable)' : ''),
+          + (primitives?.MenuItemButton === undefined ? ' (fallback rows: primitives module unavailable)' : ''),
         )
       },
     }

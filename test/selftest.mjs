@@ -5,7 +5,7 @@
  *   node test/selftest.mjs
  */
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
@@ -115,7 +115,13 @@ async function hostTest() {
   const status = fakeResponse()
   await statusRoute.handler(fakeRequest('GET', undefined), status.response)
   await status.done
-  check('status names the running code', status.response.payload?.version === '0.1.1' && status.response.payload?.workspaceRegistry === true, JSON.stringify(status.response.payload))
+  // Compare against the manifest so a version bump cannot break the suite.
+  const manifest = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'))
+  check(
+    'status names the running code',
+    status.response.payload?.version === manifest.version && status.response.payload?.workspaceRegistry === true,
+    JSON.stringify(status.response.payload),
+  )
 
   const route = deleteRoute
   const invoke = async (method, body) => {
@@ -227,21 +233,45 @@ async function clientTest() {
     if (name === '@deepseek-ai/dsh-client-ui-primitives') return primitives
     throw new Error(`unexpected require: ${name}`)
   })
-  check('returns a slots-only client plugin', Array.isArray(plugin.inject) && plugin.inject.join() === 'slots' && typeof plugin.apply === 'function')
+  check('injects slots + locale', Array.isArray(plugin.inject) && plugin.inject.join() === 'slots,locale' && typeof plugin.apply === 'function')
 
   let registration
+  const registrations = []
+  const provided = new Map()
+  const dictionaries = []
   const ctx = {
     effect(callback) { const dispose = callback(); return () => { if (typeof dispose === 'function') dispose() } },
-    get: () => undefined,
+    // A locale service is present, so every surface must be given its seat.
+    get: (name) => (name === 'locale'
+      ? { register: (ns, dicts) => { dictionaries.push({ ns, dicts }); return () => {} } }
+      : undefined),
+    provide(name, value) { provided.set(name, value) },
     slots: {
       inject(name, register) {
-        check('injects the session menu slot', name === 'sidebar.workspaces.session.menu.item', name)
+        check(
+          'injects a known slot',
+          name === 'sidebar.workspaces.session.menu.item'
+            || name === 'sidebar.session.row.leading'
+            || name === 'shell.overlay',
+          name,
+        )
         register()
       },
-      register(options, Component) { registration = { options, Component }; return () => {} },
+      register(options, Component) {
+        registrations.push({ options, Component })
+        if (options?.id === 'dsh-session-delete.delete-session') registration = { options, Component }
+        return () => {}
+      },
     },
   }
   plugin.apply(ctx)
+  check('publishes the selection service', provided.has('sessionDeleteSelection'), String(provided.has('sessionDeleteSelection')))
+  check('registers every surface', registrations.length === 5, String(registrations.length))
+  check(
+    'every surface carries the locale seat',
+    registrations.every(({ options }) => options?.locale === 'dsh-session-delete'),
+    JSON.stringify(registrations.map(({ options }) => [options?.id, options?.locale])),
+  )
   check('registers with order 500', registration?.options?.order === 500, String(registration?.options?.order))
   check('registers a unique id', registration?.options?.id === 'dsh-session-delete.delete-session', String(registration?.options?.id))
 
@@ -301,9 +331,13 @@ async function clientTest() {
   fallbackPlugin.apply({
     effect: (callback) => { callback(); return () => {} },
     get: () => undefined,
+    provide: () => {},
     slots: {
-      inject: (name, register) => { register() },
-      register: (options, Component) => { fallbackRegistration = { options, Component }; return () => {} },
+      inject: (_name, register) => { register() },
+      register: (options, Component) => {
+        if (options?.id === 'dsh-session-delete.delete-session') fallbackRegistration = { options, Component }
+        return () => {}
+      },
     },
   })
   runtime.reset()
