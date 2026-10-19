@@ -20,6 +20,7 @@
 | 脚本 | 作用 |
 |---|---|
 | `push-release.mjs <x.y.z>` | **一条命令发版**：把 `package.json` 的版本号**和 README 的版本引用**放进**同一个提交** → pnpm 打包 → 建 release（顺带建 tag）并上传附件 → 回读比对 SHA-256。从仓库根目录运行，读 `$env:DSH_GH_TOKEN`。 |
+| `release-notes.mjs` | 生成 release 正文：优先用仓库根的 `RELEASE_NOTES.md`（或用 `$RELEASE_NOTES` 指定的文件），没有则生成**带版本号与摘要**的通用文案。加 `--no-append` 可只发说明、不追加安装/校验段。**曾经把 0.1.2 的文案发进了 0.2.0**，所以这段逻辑被抽成独立模块并有测试（`release-notes.test.mjs`）。 |
 | `update-readme-version.mjs <old> <new> <in> <out>` | 单独改 README 的版本引用。也被 `push-release.mjs` 以 `import { bumpReadme }` 方式复用。每处替换都要求"恰好命中一次"；若 README 已指向**新**版本则视为已同步跳过（重跑是干净的 no-op），既不是旧版也不是新版才报错——所以不会静默错改，也不会重复提交空改动。 |
 | `bump-version.mjs <x.y.z>` | 只改 `package.json` 的 version 并提交（`push-release.mjs` 的第 1 步，单独用也行）。 |
 | `create-release.mjs <x.y.z> <tgz> <sha256>` | 只建 release 并上传附件（第 3 步）。 |
@@ -48,6 +49,14 @@
 覆盖：正常升级（版本引用全部改掉、历史 `0.1.0` 保留、行数不变）、重跑为 no-op、版本不匹配时
 **大声失败**而不是改一半、0.1.1→0.1.2 的历史路径（`console.warn` 诊断只加一次）、以及发布示例
 不带会过期的具体版本号。
+
+`release-notes.test.mjs` 是自包含的（无 fixture、不联网），验证发布正文：生成版带版本号与摘要、
+**不含任何历史版本文案**、说明文件被原样采用并追加安装/校验段、`--no-append` 只发说明、
+空说明回退到生成版、正文里的 URL 都指向本版本。
+
+```powershell
+& "<DSH>\resources\runtime\bin\node.cmd" tools/release-notes.test.mjs
+```
 
 ## 抓取与打包
 

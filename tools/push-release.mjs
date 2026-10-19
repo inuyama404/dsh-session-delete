@@ -23,6 +23,7 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
 import { bumpReadme } from './update-readme-version.mjs'
+import { buildReleaseBody } from './release-notes.mjs'
 
 const OWNER = 'inuyama404'
 const REPO = 'dsh-session-delete'
@@ -167,25 +168,28 @@ if (verify.version !== version) throw new Error(`main declares ${verify.version}
 const existing = await req(`${API}/releases/tags/${tag}`)
 if (existing.status === 200) throw new Error(`release ${tag} already exists: ${(await existing.json()).html_url}`)
 
-const body = [
-  `会话菜单的删除项此前在 CJK 界面下仍显示英文（\`Delete session\`）。`,
-  ``,
-  `- **修**：客户端声明 \`inject: ['slots', 'locale']\`，等 locale 服务就绪后再注册 \`zh\`/\`en\` 词典。此前只注入 \`slots\`，而 Cordis 4.0.4 没有可选注入、locale 服务又在一次 \`await\` 之后才 \`provide\`，第三方 bundle 有机会先跑完 \`apply\`：\`ctx.get('locale')\` 返回 \`undefined\`，词典从未注册，菜单项便一直走内置英文兜底表。`,
-  `- **修**：语言降级不再静默——注册失败与服务缺失各留一条 \`console.warn\`，启动日志标明当前是 \`locale: dsh-session-delete\` 还是 \`english fallback\`。`,
-  `- 未改动的行为：locale 服务不可用时插件仍然可用，只是回落英文（并现在会说出来）。`,
-  ``,
-  `### 安装`,
-  ``,
-  '```powershell',
-  `& "<DSH>\\resources\\runtime\\cli\\bin\\dsh.cmd" plugin --profile desktop add "https://github.com/${OWNER}/${REPO}/releases/download/${tag}/dsh-session-delete-${version}.tgz"`,
-  '```',
-  ``,
-  `### 校验`,
-  ``,
-  '```',
-  `${sha256}  dsh-session-delete-${version}.tgz`,
-  '```',
-].join('\n')
+/**
+ * Build the release notes.
+ *
+ * The notes are NOT hard-coded: an earlier version of this script shipped the
+ * 0.1.2 text inside the 0.2.0 release. `RELEASE_NOTES.md` in the repository root
+ * (or the file named by `$RELEASE_NOTES`) becomes the description; when it is
+ * absent a version-agnostic summary is generated. Pass `--no-append` to publish
+ * the notes file exactly as written.
+ */
+const notesPath = process.env.RELEASE_NOTES ?? join(root, 'RELEASE_NOTES.md')
+const appendSections = !process.argv.includes('--no-append')
+const notesText = existsSync(notesPath) ? readFileSync(notesPath, 'utf8') : null
+console.log(`  notes: ${notesText === null ? 'generated' : `${notesPath} (${notesText.length} chars)`}`)
+const body = buildReleaseBody({
+  version,
+  sha256,
+  notes: notesText,
+  owner: OWNER,
+  repo: REPO,
+  tag,
+  appendSections,
+})
 
 const relBody = await postJson(`${API}/releases`, {
   tag_name: tag,
