@@ -35,8 +35,11 @@ window.__ModuleLoader__.load({
     const ROUTE = '/dsh-session-delete/delete'
     const BULK_ROUTE = '/dsh-session-delete/bulk-delete'
     const PLAN_ROUTE = '/dsh-session-delete/plan'
+    const REPORT_ROUTE = '/dsh-session-delete/report'
     const NS = 'dsh-session-delete'
     const MAX_TITLE = 22
+    /** Delay before the second list pull, long enough for a stale pull to settle. */
+    const LIST_SETTLE_MS = 800
 
     const DICTIONARIES = {
       zh: {
@@ -144,6 +147,65 @@ window.__ModuleLoader__.load({
       return `HTTP ${String(status)}`
     }
 
+    /**
+     * Post the session list this page actually holds to the Host's diagnostic route.
+     *
+     * The sidebar derives its rows from a list only the renderer has, so a row that
+     * outlives a delete is invisible to every Host-side check. This report names the
+     * ids, their blank/origin flags, the workspace accounting and the archive set,
+     * which is enough to point at the exact session behind a stray row or an empty
+     * "Ungrouped" group.
+     * @param ctx - client plugin context.
+     * @param reason - what triggered the report (mount, delete, refresh).
+     */
+    function reportClientState(ctx, reason) {
+      if (typeof fetch !== 'function') return
+      try {
+        const list = ctx.get?.('sessions')?.list?.getSnapshot?.() ?? {}
+        const model = ctx.get?.('workspaces')?.list?.getSnapshot?.() ?? {}
+        const ids = Array.isArray(list.ids) ? list.ids : []
+        const byId = list.byId ?? {}
+        const body = {
+          reason,
+          ids,
+          rows: ids.slice(0, 200).map((id) => {
+            const row = byId[id] ?? {}
+            return {
+              id,
+              title: typeof row.title === 'string' ? row.title : null,
+              blank: row.blank === true,
+              origin: typeof row.origin === 'string' ? row.origin : null,
+            }
+          }),
+          workspaces: (Array.isArray(model.items) ? model.items : []).map((workspace) => ({
+            id: workspace?.workspaceId ?? workspace?.id ?? null,
+            title: workspace?.title ?? null,
+            sessionIds: Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : [],
+          })),
+          archivedSessionIds: Array.isArray(model.archivedSessionIds) ? model.archivedSessionIds : [],
+          pinnedSessionIds: Array.isArray(model.pinnedSessionIds) ? model.pinnedSessionIds : [],
+        }
+        void fetch(REPORT_ROUTE, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }).catch(() => {})
+      } catch (error) {
+        console.warn(`[${PLUGIN_ID}] client state report failed:`, error)
+      }
+    }
+
+    /**
+     * Re-pull the Host's session list after a delete.
+     *
+     * The sidebar groups rows from the client's session list, and that list only
+     * changes when the Host says so — a deleted session emits no removal, so the
+     * stale row survives in place: it loses its workspace slot and reappears under
+     * "Ungrouped", or leaves an empty group behind. `refresh()` re-pulls the real
+     * baseline, which is what actually removes it.
+     */
+    let requestListRefresh = () => {}
+
     /** Ask the Host to delete the session and surface its refusal verbatim. */
     async function deleteSession(sessionId) {
       let response
@@ -163,7 +225,19 @@ window.__ModuleLoader__.load({
         payload = null
       }
       if (!response.ok || payload?.ok !== true) throw new Error(reasonText(payload, response.status))
+      hideSessionRow(sessionId)
+      requestListRefresh('delete')
+      // `refresh()` joins a pull that is already in flight, and one started before
+      // this delete resolves to the pre-delete list — the deleted id then comes
+      // straight back. A second pull after that one settles drops it for good.
+      scheduleListRefresh('delete-settled')
       return payload
+    }
+
+    /** Refresh again once a stale in-flight pull has had time to settle. */
+    function scheduleListRefresh(reason) {
+      if (typeof setTimeout !== 'function') return
+      setTimeout(() => requestListRefresh(reason), LIST_SETTLE_MS)
     }
 
     /**
@@ -235,6 +309,111 @@ window.__ModuleLoader__.load({
         if (row !== null && row !== undefined && /row/i.test(String(row.className))) return id
       }
       return null
+    }
+
+    /** Session ids whose row this page already hid after a successful delete. */
+    const hiddenRows = new Set()
+    /** Housekeeping rules this page installed, keyed so each is added once. */
+    const installedRules = new Set()
+
+    /**
+     * Install one stylesheet rule once.
+     * @param key - identity of the rule; a repeat call is a no-op.
+     * @param css - rule text.
+     * @returns whether the rule is in place.
+     */
+    function installRule(key, css) {
+      if (typeof document === 'undefined' || document?.head === undefined) return false
+      if (installedRules.has(key)) return true
+      try {
+        const tag = document.createElement('style')
+        tag.dataset.plugin = PLUGIN_ID
+        tag.dataset.rule = key
+        tag.textContent = css
+        document.head.appendChild(tag)
+        installedRules.add(key)
+        return true
+      } catch {
+        // A DOM we cannot touch only costs the immediate hide.
+        return false
+      }
+    }
+
+    function removeRule(key) {
+      if (typeof document === 'undefined' || document?.head === undefined) return
+      try {
+        for (const tag of document.querySelectorAll?.(`style[data-rule="${key}"]`) ?? []) tag.remove()
+        installedRules.delete(key)
+      } catch {
+        // Nothing to undo when the DOM cannot be read.
+      }
+    }
+
+    /**
+     * Hide one deleted session's row on this page.
+     *
+     * A session the host never materialized on disk exists only in the host's
+     * in-memory list: there is no file to unlink, so the row would stay on screen
+     * although the host reports success. Every row carries
+     * `data-row-key="session:<id>"`, so one scoped rule hides exactly that row and
+     * keeps hiding it across re-renders. The rule is inert as soon as the host's
+     * list stops carrying the id, and the next page load drops it.
+     * @param sessionId - the session whose row was just deleted.
+     */
+    function hideSessionRow(sessionId) {
+      if (hiddenRows.has(sessionId)) return
+      if (installRule(`row:${sessionId}`, `[data-row-key="session:${sessionId}"]{display:none !important}`)) {
+        hiddenRows.add(sessionId)
+        scheduleUngroupedReconcile()
+      }
+    }
+
+    /**
+     * Hide the "Ungrouped" bucket while it holds no visible row.
+     *
+     * The sidebar draws that bucket from the client's session list, and a deleted
+     * session can stay in that list while its Host agent is still resident — the
+     * row is hidden by this plugin, leaving a group header with nothing under it.
+     * The header is the only element keyed `workspace:` (real Workspaces key by
+     * id), so this never touches a named workspace.
+     */
+    function reconcileUngroupedHeader() {
+      if (typeof document === 'undefined' || typeof document.querySelector !== 'function') return
+      let header
+      try {
+        header = document.querySelector('[data-row-key="workspace:"]')
+      } catch {
+        return
+      }
+      if (header === null || header === undefined) {
+        removeRule('group:ungrouped')
+        return
+      }
+      let hasVisibleRow = false
+      let sibling = header.nextElementSibling
+      while (sibling !== null && sibling !== undefined) {
+        const key = sibling.getAttribute?.('data-row-key') ?? ''
+        if (key.startsWith('workspace:')) break
+        if (key.startsWith('session:') && sibling.offsetParent !== null) {
+          hasVisibleRow = true
+          break
+        }
+        sibling = sibling.nextElementSibling
+      }
+      if (hasVisibleRow) removeRule('group:ungrouped')
+      else installRule('group:ungrouped', '[data-row-key="workspace:"]{display:none !important}')
+    }
+
+    /**
+     * Reconcile the "Ungrouped" header now and once more after React re-renders.
+     *
+     * Hiding a row and hiding its group cannot happen in the same frame: the group
+     * is derived from the session list, so it only disappears after the next
+     * render. The second pass catches that render.
+     */
+    function scheduleUngroupedReconcile() {
+      reconcileUngroupedHeader()
+      if (typeof setTimeout === 'function') setTimeout(reconcileUngroupedHeader, 250)
     }
 
     /**
@@ -364,6 +543,16 @@ window.__ModuleLoader__.load({
             const refused = Array.isArray(payload.results)
               ? payload.results.filter((row) => row.ok !== true).map((row) => row.sessionId)
               : []
+            // A session the host never wrote to disk has no file to unlink and no
+            // archive entry to hide it with, so its row would survive a successful
+            // bulk delete exactly like the single-row path.
+            if (Array.isArray(payload.results)) {
+              for (const row of payload.results) if (row?.ok === true) hideSessionRow(row.sessionId)
+            }
+            if ((payload.deleted ?? 0) > 0) {
+              requestListRefresh('bulk-delete')
+              scheduleListRefresh('bulk-delete-settled')
+            }
             if (refused.length === 0) {
               set({
                 active: false,
@@ -981,6 +1170,28 @@ window.__ModuleLoader__.load({
           selection = null
         }, `${PLUGIN_ID}: selection store`)
 
+        // A deleted session emits no removal event, so the client's session list
+        // keeps the row until it is re-pulled: the row loses its workspace slot and
+        // shows up under "Ungrouped", or leaves an empty group behind. `refresh()`
+        // is the client session service's own baseline pull. Each pull ends with a
+        // state report, so the diagnostic route always describes what the renderer
+        // currently holds.
+        requestListRefresh = (reason = 'refresh') => {
+          let pulled
+          try {
+            const sessions = ctx.get?.('sessions')
+            if (sessions !== undefined && typeof sessions.refresh === 'function') {
+              pulled = Promise.resolve(sessions.refresh()).catch(() => {})
+            }
+          } catch (error) {
+            console.warn(`[${PLUGIN_ID}] session list refresh failed:`, error)
+          }
+          Promise.resolve(pulled).then(() => {
+            reportClientState(ctx, reason)
+            scheduleUngroupedReconcile()
+          }).catch(() => {})
+        }
+
         const localeOption = localised ? { locale: NS } : {}
 
         /**
@@ -1039,6 +1250,11 @@ window.__ModuleLoader__.load({
           + ` (locale: ${localised ? NS : 'english fallback'})`
           + (primitives?.MenuItemButton === undefined ? ' (fallback rows: primitives module unavailable)' : ''),
         )
+
+        // Reconcile once on load: a session deleted before this bundle mounted can
+        // still sit in the client's list (and leave an empty "Ungrouped" group).
+        // The pull joins any baseline read already in flight.
+        requestListRefresh('mount')
       },
     }
   },

@@ -15,7 +15,20 @@
  *      the row immediately (this must happen while the session still exists,
  *      because archiving validates the session's existence);
  *   3. drop the session from its Workspace accounting entry;
- *   4. delete the session's artifact directory and its projection-cache record.
+ *   4. delete the session's artifact directory and its projection-cache record,
+ *      verifying the directory is really gone (a still-open write handle can
+ *      re-create the log right after the unlink);
+ *   5. drop the id from the archive set. The client's session list carries
+ *      archived Sessions, so a surviving mark keeps the deleted id listed and,
+ *      with its workspace slot already detached, renders it as a loose
+ *      "Ungrouped" row. Clearing the mark lets the client's list refresh drop
+ *      the id, which is what the client half triggers after every delete.
+ *
+ * A session with no log directory is archived and reported as `not-materialized`:
+ * a blank session the store created but never wrote has nothing to unlink, so
+ * hiding it is all a delete can mean. `GET /dsh-session-delete/diagnose?sessionId=…`
+ * reports where a session lives, and `GET /dsh-session-delete/last` keeps the
+ * recent delete outcomes so a failure is readable from a shell.
  *
  * Everything the plugin needs is read through public services, so an upgrade
  * that renames a private field cannot corrupt a delete: each step either
@@ -42,6 +55,9 @@ const ROUTE_PATH = '/dsh-session-delete/delete'
 const STATUS_PATH = '/dsh-session-delete/status'
 const PLAN_PATH = '/dsh-session-delete/plan'
 const BULK_PATH = '/dsh-session-delete/bulk-delete'
+const DIAGNOSE_PATH = '/dsh-session-delete/diagnose'
+const LAST_PATH = '/dsh-session-delete/last'
+const REPORT_PATH = '/dsh-session-delete/report'
 /** Installed package version, read once so /status names the running code. */
 const PLUGIN_VERSION = readPluginVersion()
 
@@ -56,6 +72,37 @@ const BULK_MAX = 200
  * as unpaginated, so a large store must not be able to stall the route.
  */
 const LIST_TIMEOUT_MS = 5000
+/**
+ * Removal is retried because a session that is still open in another view can
+ * re-materialize its log from an in-memory write handle immediately after the
+ * directory is unlinked. The retry makes "deleted" stick instead of leaving a row
+ * that reports the session back as archived.
+ */
+const REMOVE_ATTEMPTS = 4
+const REMOVE_RETRY_MS = 120
+/** How many delete attempts the read-only `/last` route keeps. */
+const RECENT_ATTEMPT_LIMIT = 20
+
+/**
+ * Recent delete outcomes, newest last. A failed delete only shows its reason in
+ * the row that failed, which is easy to lose; this keeps the same facts readable
+ * from a shell so a report does not depend on transcribing a tooltip.
+ */
+const recentAttempts = []
+
+/** Most recent client-state report, kept in memory for the report route. */
+let lastClientReport = null
+
+/**
+ * Append one attempt record for the `/last` route.
+ * @param entry - attempt facts.
+ */
+function recordAttempt(entry) {
+  recentAttempts.push({ at: new Date().toISOString(), ...entry })
+  while (recentAttempts.length > RECENT_ATTEMPT_LIMIT) recentAttempts.shift()
+}
+/** How many directory levels below `sessions/` the artifact scan may search. */
+const SCAN_MAX_DEPTH = 4
 
 /** Read this package's version without depending on any service. */
 function readPluginVersion() {
@@ -67,6 +114,8 @@ function readPluginVersion() {
   }
 }
 const MAX_BODY_BYTES = 8 * 1024
+/** A client-state report carries one row per listed session, so it gets more room. */
+const MAX_REPORT_BYTES = 64 * 1024
 /**
  * Official session ids come in three shapes: `session-<uuid>` (the Web UI),
  * `session-<n>` (store-minted) and a bare `<uuid>` (subagent children). The
@@ -94,6 +143,18 @@ export function apply(ctx) {
     'dsh-session-delete: bulk delete route',
   )
   ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: DIAGNOSE_PATH, handler: createDiagnoseHandler(ctx) }),
+    'dsh-session-delete: diagnose route',
+  )
+  ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: LAST_PATH, handler: createLastHandler() }),
+    'dsh-session-delete: attempt log route',
+  )
+  ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: REPORT_PATH, handler: createReportHandler() }),
+    'dsh-session-delete: client state report route',
+  )
+  ctx.effect(
     () => ctx.webServer.register({
       kind: 'exact',
       path: STATUS_PATH,
@@ -104,12 +165,15 @@ export function apply(ctx) {
           version: PLUGIN_VERSION,
           workspaceRegistry: ctx.get('workspaceRegistry') !== undefined,
           bulk: { plan: PLAN_PATH, delete: BULK_PATH, maxPerRequest: BULK_MAX },
+          diagnose: DIAGNOSE_PATH,
+          last: LAST_PATH,
+          report: REPORT_PATH,
         })
       },
     }),
     'dsh-session-delete: status route',
   )
-  ctx.logger?.info?.(`[dsh-session-delete] ${PLUGIN_VERSION} ready: ${ROUTE_PATH} (+ plan, bulk)`)
+  ctx.logger?.info?.(`[dsh-session-delete] ${PLUGIN_VERSION} ready: ${ROUTE_PATH} (+ plan, bulk, diagnose)`)
 }
 
 /**
@@ -132,18 +196,31 @@ function createHandler(ctx) {
     }
     const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
     if (!SESSION_ID_RE.test(sessionId)) {
+      recordAttempt({ route: 'delete', sessionId: sessionId.slice(0, 96), status: 400, ok: false, error: 'invalid-session-id' })
       respond(response, 400, { ok: false, error: 'invalid-session-id' })
       return
     }
     try {
       const outcome = await deleteSession(ctx, sessionId)
+      recordAttempt({
+        route: 'delete',
+        sessionId,
+        status: outcome.ok ? 200 : outcome.status ?? 500,
+        ok: outcome.ok === true,
+        error: outcome.error,
+        note: outcome.note,
+        message: outcome.message,
+        removed: Array.isArray(outcome.removed) ? outcome.removed.length : 0,
+      })
       respond(response, outcome.ok ? 200 : outcome.status ?? 500, outcome)
     } catch (error) {
+      const message = errorMessage(error)
+      recordAttempt({ route: 'delete', sessionId, status: 500, ok: false, error: 'delete-failed', message })
       ctx.logger?.warn?.(`[dsh-session-delete] deleting ${sessionId} failed: ${String(error)}`)
       respond(response, 500, {
         ok: false,
         error: 'delete-failed',
-        message: errorMessage(error),
+        message,
       })
     }
   }
@@ -176,6 +253,41 @@ function createPlanHandler(ctx) {
     } catch (error) {
       ctx.logger?.warn?.(`[dsh-session-delete] plan failed: ${errorMessage(error)}`)
       respond(response, 500, { ok: false, error: 'plan-failed', message: errorMessage(error) })
+    }
+  }
+}
+
+/**
+ * Build the HTTP handler for the read-only diagnosis route.
+ *
+ * A delete that reports success while the row survives is indistinguishable from
+ * a delete that never ran, so this route answers the only question that matters:
+ * where does this session live on this host, right now? It reports what the store
+ * says, what `locate()` resolves, whether the on-disk scan found a directory, and
+ * how the Workspace registry accounts the id — without touching anything.
+ * @param ctx - Host plugin context.
+ * @returns the exact-route handler.
+ */
+function createDiagnoseHandler(ctx) {
+  return async (request, response) => {
+    if (request.method !== 'GET' && request.method !== 'POST') {
+      respond(response, 405, { ok: false, error: 'method-not-allowed' })
+      return
+    }
+    const raw = readSessionId(request)
+    if (raw === null) {
+      respond(response, 400, {
+        ok: false,
+        error: 'invalid-session-id',
+        message: `pass a session id as ?sessionId=, e.g. ${DIAGNOSE_PATH}?sessionId=session-<uuid>`,
+      })
+      return
+    }
+    try {
+      respond(response, 200, await diagnoseSession(ctx, raw))
+    } catch (error) {
+      ctx.logger?.warn?.(`[dsh-session-delete] diagnose failed: ${errorMessage(error)}`)
+      respond(response, 500, { ok: false, error: 'diagnose-failed', message: errorMessage(error) })
     }
   }
 }
@@ -250,6 +362,10 @@ function createBulkHandler(ctx) {
       `[dsh-session-delete] bulk delete: ${deleted}/${batch.length} removed`
       + ` (${results.filter((r) => !r.ok).map((r) => `${r.sessionId}:${r.error ?? 'error'}`).join(', ') || 'no failures'})`,
     )
+    for (const row of results) {
+      if (row.ok) continue
+      recordAttempt({ route: 'bulk-delete', sessionId: row.sessionId, status: row.status, ok: false, error: row.error, message: row.message })
+    }
 
     respond(response, 200, {
       ok: deleted === batch.length,
@@ -423,13 +539,13 @@ async function deleteSession(ctx, sessionId) {
   let directory = locateArtifactDirectory(ctx, header)
   if (directory === undefined) directory = await scanArtifactDirectory(home, sessionId)
 
-  if (header === undefined && directory === undefined) {
-    // Nothing stored and nothing on disk: forget whatever accounting remains.
-    await detachEverywhere(ctx, sessionId)
-    return { ok: true, removed: [], note: 'no-artifact' }
-  }
-
   // 1. Hide the session everywhere first, while it still exists.
+  //
+  // Archiving is how every DSH surface stops offering a row, and it is the reason
+  // a delete looks like a delete: an id left unarchived becomes a "loose" session
+  // and reappears in the sidebar's Ungrouped bucket. The archive mark therefore
+  // stays after the files are gone; it is invisible because nothing lists a
+  // session without a log, and the client half hides the row it just deleted.
   const registry = ctx.get('workspaceRegistry')
   if (registry === undefined) {
     ctx.logger?.warn?.('[dsh-session-delete] no workspace registry: the deleted row stays visible until the next listing')
@@ -453,18 +569,99 @@ async function deleteSession(ctx, sessionId) {
   // 2. Drop the workspace accounting entry while the header still resolves.
   await detachEverywhere(ctx, sessionId)
 
-  // 3. Remove the artifacts.
+  // 3. Nothing on disk: a blank session the store created but never materialized.
+  //    Hiding it is all a delete can mean, and the archive step above already did
+  //    that, so report the truth instead of claiming artifacts were removed.
+  if (directory === undefined) {
+    await clearArchiveMark(ctx, sessionId)
+    return { ok: true, removed: [], note: header === undefined ? 'no-artifact' : 'not-materialized' }
+  }
+
+  // 4. Remove the artifacts.
   const removed = []
-  if (directory !== undefined && basename(directory) === sessionId && existsSync(directory)) {
-    await rm(directory, { recursive: true, force: true })
-    removed.push(directory)
+  if (basename(directory) === sessionId) {
+    const existed = existsSync(directory)
+    const gone = await removeArtifactDirectory(directory)
+    if (!gone) {
+      return {
+        ok: false,
+        status: 500,
+        error: 'artifact-not-removed',
+        message: `the session log directory survived deletion: ${directory}`,
+        directory,
+        hint: `GET ${DIAGNOSE_PATH}?sessionId=${encodeURIComponent(sessionId)}`,
+      }
+    }
+    if (existed) removed.push(directory)
   }
   const cacheRecord = join(home, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
   if (existsSync(cacheRecord)) {
     await rm(cacheRecord, { force: true })
     removed.push(cacheRecord)
   }
+
+  // 5. Drop the archive mark. The archived id stays in the client's session list
+  //    (that list carries archived Sessions so the "Archived" filter can show
+  //    them), and our detach removed its workspace slot, so a surviving mark
+  //    renders the deleted row as a loose "Ungrouped" session — or, with the row
+  //    hidden, as an empty "Ungrouped" group. Clearing it lets the client's list
+  //    refresh drop the id entirely now that no log backs it.
+  await clearArchiveMark(ctx, sessionId)
+
   return removed.length === 0 ? { ok: true, removed, note: 'no-artifact' } : { ok: true, removed }
+}
+
+/**
+ * Drop a deleted session's id from the Workspace archive set.
+ *
+ * Only called once the log is gone: the archive mark is how the row hides while
+ * the files go away, and leaving it behind would keep a session with no artifacts
+ * listed under "Archived". A failure is a warning — the artifacts are already
+ * deleted, so the worst case is that stale archived referent.
+ * @param ctx - Host plugin context.
+ * @param sessionId - Session id whose artifacts were just removed.
+ */
+async function clearArchiveMark(ctx, sessionId) {
+  const registry = ctx.get('workspaceRegistry')
+  if (registry === undefined) return
+  let archived
+  try {
+    archived = registry.archivedSessionIds
+  } catch {
+    return
+  }
+  const ids = Array.isArray(archived) ? archived : archived instanceof Set ? [...archived] : []
+  if (!ids.includes(sessionId)) return
+  if (typeof registry.unarchiveSession !== 'function') return
+  try {
+    await registry.unarchiveSession(sessionId)
+  } catch (error) {
+    ctx.logger?.warn?.(`[dsh-session-delete] could not clear the archive mark for ${sessionId}: ${errorMessage(error)}`)
+  }
+}
+
+/**
+ * Delete one artifact directory, retrying while it stays on disk.
+ *
+ * A session that is still attached to a live write handle can re-create its log
+ * right after the unlink, so one `rm` is not proof of deletion. This returns true
+ * only once the path is verifiably absent.
+ * @param directory - absolute artifact directory.
+ * @returns whether the directory is gone.
+ */
+async function removeArtifactDirectory(directory) {
+  let lastError
+  for (let attempt = 0; attempt < REMOVE_ATTEMPTS; attempt += 1) {
+    try {
+      await rm(directory, { recursive: true, force: true })
+    } catch (error) {
+      lastError = error
+    }
+    if (!existsSync(directory)) return true
+    await new Promise((resolve) => setTimeout(resolve, REMOVE_RETRY_MS))
+  }
+  if (lastError !== undefined) return false
+  return !existsSync(directory)
 }
 
 /**
@@ -488,7 +685,14 @@ function locateArtifactDirectory(ctx, header) {
 }
 
 /**
- * Find `<DSH home>/sessions/<workspace dir>/<session id>` by name.
+ * Find a directory named exactly after the session id under `<DSH home>/sessions`.
+ *
+ * The documented layout is `<sessions>/<workspace dir>/<session id>`, checked
+ * first because it is one `readdir` and one `exists`. A host upgrade may nest or
+ * rename the levels around the session directory, which used to turn a delete into
+ * "archived but still on disk"; the bounded walk below finds the directory by name
+ * instead of assuming its depth. The name must equal the session id, so a match is
+ * still proof that this is that session's own directory.
  * @param home - Resolved DSH home directory.
  * @param sessionId - Validated session id.
  * @returns the session's directory, or undefined when it is not on disk.
@@ -506,6 +710,32 @@ async function scanArtifactDirectory(home, sessionId) {
     if (!entry.isDirectory()) continue
     const candidate = join(root, entry.name, sessionId)
     if (existsSync(candidate)) return candidate
+  }
+  return findDirectoryNamed(root, sessionId)
+}
+
+/**
+ * Walk `directory` breadth-first looking for a child directory named `name`.
+ * @param directory - absolute directory to walk.
+ * @param name - exact directory basename to match.
+ * @returns the matching directory, or undefined.
+ */
+async function findDirectoryNamed(directory, name) {
+  const queue = [{ directory, depth: 0 }]
+  while (queue.length > 0) {
+    const current = queue.shift()
+    let entries
+    try {
+      entries = await readdir(current.directory, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const full = join(current.directory, entry.name)
+      if (entry.name === name) return full
+      if (current.depth + 1 < SCAN_MAX_DEPTH) queue.push({ directory: full, depth: current.depth + 1 })
+    }
   }
   return undefined
 }
@@ -568,17 +798,210 @@ function isActiveSessionError(error) {
 }
 
 /**
+ * Build the handler for the read-only attempt log.
+ *
+ * Only facts the plugin observed are reported: the id, the HTTP status the client
+ * received, the outcome code and the number of artifacts removed. That is enough
+ * to tell a refusal from a crash without the client-side label.
+ * @returns the exact-route handler.
+ */
+function createLastHandler() {
+  return (request, response) => {
+    if (request.method !== 'GET') {
+      respond(response, 405, { ok: false, error: 'method-not-allowed' })
+      return
+    }
+    respond(response, 200, {
+      ok: true,
+      plugin: 'dsh-session-delete',
+      version: PLUGIN_VERSION,
+      count: recentAttempts.length,
+      attempts: [...recentAttempts].reverse(),
+    })
+  }
+}
+
+/**
+ * Build the handler for the client-state report.
+ *
+ * The sidebar's rows are derived in the renderer from a session list the Host
+ * cannot read back, so a row that survives a delete is invisible to every other
+ * diagnostic here. The client half posts what it actually holds and this route
+ * keeps it, which is what turns "there is an empty Ungrouped group" into a named
+ * session id. Nothing is written to disk.
+ * @returns the exact-route handler.
+ */
+function createReportHandler() {
+  return async (request, response) => {
+    if (request.method === 'GET') {
+      respond(response, 200, {
+        ok: true,
+        plugin: 'dsh-session-delete',
+        version: PLUGIN_VERSION,
+        report: lastClientReport,
+      })
+      return
+    }
+    if (request.method !== 'POST') {
+      respond(response, 405, { ok: false, error: 'method-not-allowed' })
+      return
+    }
+    let body
+    try {
+      body = await readJsonBody(request, MAX_REPORT_BYTES)
+    } catch {
+      respond(response, 400, { ok: false, error: 'bad-request' })
+      return
+    }
+    lastClientReport = { at: new Date().toISOString(), ...body }
+    respond(response, 200, { ok: true, stored: true })
+  }
+}
+
+/**
+ * Read a session id from the request's `?sessionId=` query.
+ * @param request - incoming request.
+ * @returns the validated id, or null when absent or malformed.
+ */
+function readSessionId(request) {
+  const raw = typeof request?.url === 'string' ? request.url : '/'
+  let url
+  try {
+    url = new URL(raw, 'http://dsh.invalid')
+  } catch {
+    return null
+  }
+  const value = (url.searchParams.get('sessionId') ?? '').trim()
+  return SESSION_ID_RE.test(value) ? value : null
+}
+
+/**
+ * Describe where one session lives on this host, without changing anything.
+ * @param ctx - Host plugin context.
+ * @param sessionId - Validated session id.
+ * @returns the diagnosis report served by the diagnose route.
+ */
+async function diagnoseSession(ctx, sessionId) {
+  const home = dshHome(ctx)
+  const persistence = ctx.sessionPersistence
+  const report = {
+    ok: true,
+    plugin: 'dsh-session-delete',
+    version: PLUGIN_VERSION,
+    sessionId,
+    home,
+    sessionsRoot: join(home, 'sessions'),
+    store: { stat: 'unavailable' },
+    locate: { path: null, directory: null, namedAfterSession: false },
+    scan: { directory: null },
+    account: { workspaces: 0, accountedIn: [], archived: false, active: false },
+    artifacts: { directory: null, directoryExists: false, logFiles: [], cache: null, cacheExists: false },
+  }
+
+  let header
+  if (typeof persistence?.stat === 'function') {
+    try {
+      const snapshot = await persistence.stat(sessionId)
+      header = snapshot?.header
+      report.store = header === undefined
+        ? { stat: 'unknown-session' }
+        : {
+            stat: 'ok',
+            id: typeof header.id === 'string' ? header.id : null,
+            cwd: typeof header.cwd === 'string' ? header.cwd : null,
+            createdAt: typeof header.createdAt === 'number' ? header.createdAt : null,
+          }
+    } catch (error) {
+      report.store = { stat: 'error', message: errorMessage(error) }
+    }
+  }
+
+  if (header !== undefined && typeof persistence?.locate === 'function') {
+    try {
+      const location = persistence.locate(header)
+      const path = typeof location?.path === 'string' ? location.path : null
+      const directory = path === null ? null : dirname(path)
+      report.locate = {
+        path,
+        directory,
+        namedAfterSession: directory !== null && basename(directory) === header.id,
+      }
+    } catch (error) {
+      report.locate = { path: null, directory: null, namedAfterSession: false, message: errorMessage(error) }
+    }
+  }
+
+  const scanned = await scanArtifactDirectory(home, sessionId)
+  report.scan.directory = scanned ?? null
+  const directory = report.locate.namedAfterSession ? report.locate.directory : report.scan.directory
+  report.artifacts.directory = directory
+  report.artifacts.directoryExists = directory !== null && existsSync(directory)
+  if (report.artifacts.directoryExists) {
+    try {
+      const entries = await readdir(directory, { withFileTypes: true })
+      report.artifacts.logFiles = entries.filter((entry) => entry.isFile()).map((entry) => entry.name)
+    } catch {
+      // A directory we cannot list still exists; the verdict does not depend on it.
+    }
+  }
+  const cache = join(home, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
+  report.artifacts.cache = cache
+  report.artifacts.cacheExists = existsSync(cache)
+
+  const registry = ctx.get('workspaceRegistry')
+  if (registry !== undefined) {
+    let workspaces
+    try {
+      workspaces = registry.list()
+    } catch {
+      workspaces = undefined
+    }
+    const list = Array.isArray(workspaces) ? workspaces : []
+    report.account.workspaces = list.length
+    for (const workspace of list) {
+      if (Array.isArray(workspace?.sessionIds) && workspace.sessionIds.includes(sessionId)) {
+        report.account.accountedIn.push(workspace?.path ?? workspace?.id ?? 'unknown')
+      }
+    }
+    try {
+      const archived = registry.archivedSessionIds
+      const ids = Array.isArray(archived) ? archived : archived instanceof Set ? [...archived] : []
+      report.account.archived = ids.includes(sessionId)
+    } catch {
+      // An unreadable archive set is reported as "not archived"; the delete path
+      // re-reads it on its own.
+    }
+  }
+
+  report.verdict = diagnoseVerdict(report)
+  return report
+}
+
+/**
+ * Say what a delete would do with the state a diagnosis observed.
+ * @param report - the report built by {@link diagnoseSession}.
+ * @returns one of `deletable`, `store-without-artifact`, `accounted-without-artifact`, `already-gone`.
+ */
+function diagnoseVerdict(report) {
+  if (report.artifacts.directoryExists) return 'deletable'
+  if (report.store.stat === 'ok') return 'store-without-artifact'
+  if (report.account.accountedIn.length > 0 || report.account.archived) return 'accounted-without-artifact'
+  return 'already-gone'
+}
+
+/**
  * Read one bounded JSON request body.
  * @param request - incoming request.
+ * @param limit - maximum accepted body size in bytes.
  * @returns the parsed body, or an empty object for an empty body.
  */
-function readJsonBody(request) {
+function readJsonBody(request, limit = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     let size = 0
     const chunks = []
     request.on('data', (chunk) => {
       size += chunk.length
-      if (size > MAX_BODY_BYTES) {
+      if (size > limit) {
         request.destroy()
         reject(new Error('request body too large'))
         return

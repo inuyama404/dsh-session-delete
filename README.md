@@ -49,9 +49,39 @@ DSH 会话删除插件：在侧边栏会话行的「⋯」菜单里增加 **删�
 | `GET` | `/dsh-session-delete/plan` | 列出可删会话（`sessionPersistence.list()` 优先，失败时回退扫描 `sessions/`），供「全选」使用 |
 | `POST` | `/dsh-session-delete/bulk-delete` | body `{"sessionIds":[...]}`，顺序删除，逐条返回 `{sessionId, ok, status, error}`；单条失败不中断；单批上限 200，超出部分回 `remaining` |
 | `POST` | `/dsh-session-delete/delete` | 单条删除（原有） |
+| `GET` | `/dsh-session-delete/diagnose?sessionId=<id>` | **只读**诊断：报告 store 是否认识该 id、`locate()` 解析出的路径、磁盘扫描找到的目录、工作区记账与归档状态，以及「现在删会发生什么」的判定 |
+| `GET` | `/dsh-session-delete/last` | **只读**：最近 20 次删除尝试（id、返回给客户端的 HTTP 状态、`ok`/`error`/`note`、删掉几个产物）。删失败时不必再抄界面上的红字，直接读这里 |
+| `GET`/`POST` | `/dsh-session-delete/report` | **只读**诊断回传：客户端在加载和每次删除后，把自己的会话列表、工作区记账、归档集合 POST 上来；`GET` 读回最后一次。侧边栏的行是渲染器自己算的、宿主看不到，只有这个回传能指出"空分组/残留行"对应哪个 id |
 | `GET` | `/dsh-session-delete/status` | 版本与端点自述 |
 
 任一 id 不合法则**整批拒绝**（400），不做部分删除。每次批量操作会写一条 `info` 日志（`bulk delete: X/Y removed (…)`），作为不可恢复操作的可追溯记录。
+
+## 0.2.1：删除变成「可验证」，不再可能「只归档不删盘」
+
+0.2.0 的删除顺序是「归档 → 摘记账 → 删盘」，其中**删盘一步如果找不到目录，会直接返回成功**（`{"ok":true,"removed":[]}`）。这种"成功"在界面上表现为：会话从列表消失，但 id 已进了归档集合 —— 于是它出现在**已归档**里，看起来像"删除变成了归档"，而磁盘上什么都没少。
+
+0.2.1 保留「归档 → 摘记账 → 删盘」这个顺序，但把每一步都变成可验证的，并在客户端补上最后一下：
+
+| 改动 | 效果 |
+|---|---|
+| **归档只用来"删的过程中先藏起来"** | 归档仍然发生在删盘之前（界面立刻不再列出它），但**文件删完后立刻 `unarchiveSession()` 清掉标记**。原因是客户端的会话列表会保留"已归档"会话：标记留着的话，这个已摘掉工作区记账的 id 就变成"游离会话"，被侧边栏画进**「未分组」**——也就是"删完掉进未分组 / 留一个空分组"的真因。清掉标记，id 才可能从列表里真正消失 |
+| **客户端删完重拉两次** | 删除后先 `ctx.get('sessions').refresh()` 一次，**800ms 后再拉一次**。因为 `refreshList()` 会**复用进行中的拉取**：删除瞬间正巧有拉取在飞时，它返回的是删除前的列表，刚删的 id 立刻回弹。第二次拉取不再复用，id 才真正离开列表 |
+| **客户端隐藏已删行** | 删除成功后客户端再注入一条只作用于该会话的规则 `[data-row-key="session:<id>"]{display:none}`，行立刻从界面消失（单条与批量都覆盖），挡住两次拉取之间的窗口期 |
+| **空的「未分组」自动收起** | 宿主列表包含"实时但已无日志"的会话（Agent 还在内存里，没有任何公开 API 能丢弃），`refresh()` 也去不掉它。这种 id 被摘了记账、又不是归档 → 侧边栏会画出「未分组」。所以客户端在每次删除与每次重拉后会检查该分组：**里面没有可见行就把这个分组头也隐藏**。作用域只有 `data-row-key="workspace:"`（真实工作区用的是各自 id），不会误伤「默认工作区」 |
+| **按名字扫描的兜底加深** | 除文档布局 `sessions/<工作区目录>/<会话id>` 外，还会在 `sessions/` 下**按目录名深度搜索**（最多 4 层）。宿主升级挪动/嵌套目录层级时，删除仍然能找到并删掉 |
+| **删盘后复核 + 重试** | 目录删完再确认一次；仍存在就重试（最多 4 次、间隔 120ms）。仍在打开中的会话可能借助内存写入句柄立刻把日志重新落盘，这一步让"删除"真正生效，删不掉则返回 `500 artifact-not-removed`，不再谎报成功 |
+| **从未落盘的空会话** | `create()` 之后没写过任何事件的会话（典型是刚点「新建会话」就删）在磁盘上没有任何产物，也没有公开 API 能丢弃它。这种删除返回 `{"ok":true,"note":"not-materialized"}`：**归档 → 摘记账 → 清标记**，再由客户端重拉把它从列表里去掉 |
+| **尝试记录** | 每次删除（含批量里失败的每一条）都记进 `/dsh-session-delete/last`：状态码、`error`、`note`、删掉几个产物。定位失败不必再依赖界面上的红字 |
+
+诊断端点用来收口这类问题，**不碰任何文件**：
+
+```powershell
+curl.exe -sS "http://127.0.0.1:19387/dsh-session-delete/diagnose?sessionId=<会话id>"
+curl.exe -sS "http://127.0.0.1:19387/dsh-session-delete/last"
+```
+
+返回里的 `verdict` 直接给结论：`deletable`（能删）、`store-without-artifact`（store 认识但盘上没有 → 删除会按 `not-materialized` 处理）、`accounted-without-artifact`（只剩记账/归档残留）、`already-gone`（彻底没了）。同时给出 `store`（`stat` 结果）、`locate`（路径与是否指向该会话目录）、`scan`（磁盘扫描命中）、`account`（哪些工作区记账、是否归档）、`artifacts`（目录、日志文件名、投影缓存）。
+
 
 ## 在 0.2.0-rc.2 上的实测结果
 
@@ -105,7 +135,7 @@ DSH 会自动升级，所以 0.2.0 的玩法在 0.2.1-rc.2 上重新核对过：
 
 ### A. 用打包文件（推荐）
 
-`dist\dsh-session-delete-0.2.0.tgz` 是现成的单文件安装包（含 `index.js` / `client.js` / `cordis.patch.yml` / `package.json` / `README.md` / `test`）。改动源码后可以自己重打：
+`dsh-session-delete-0.2.1.tgz` 是单文件安装包（含 `index.js` / `client.js` / `cordis.patch.yml` / `package.json` / `README.md` / `test`）。仓库里的 `dist\` 目前只有上一版 `dsh-session-delete-0.2.0.tgz`，改动源码后按下面命令重打：
 
 ```powershell
 & "D:\DeepSeek Harness\resources\runtime\bin\node.cmd" "D:\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "<本目录>" pack --pack-destination "<输出目录>"
@@ -116,7 +146,7 @@ DSH 会自动升级，所以 0.2.0 的玩法在 0.2.1-rc.2 上重新核对过：
 1. **先打开一次 DeepSeek Harness 桌面客户端**（初始化 profile），然后**完全退出**；
 2. 把 tgz 拷过去，然后：
    ```powershell
-   & "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "D:\路径\dsh-session-delete-0.2.0.tgz"
+   & "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "D:\路径\dsh-session-delete-0.2.1.tgz"
    ```
 3. 重新打开客户端，会话行「⋯」菜单里出现「删除会话」即成功。
 
@@ -134,24 +164,24 @@ tgz 是**复制安装**：装完后 tgz 和源码目录都可以删掉，实际�
 
 ### C. 放到 GitHub 再装
 
-已发布仓库：<https://github.com/inuyama404/dsh-session-delete>（v0.2.0 release 附 tgz）。
+已发布仓库：<https://github.com/inuyama404/dsh-session-delete>（v0.2.1 release 附 tgz）。
 
 **方式 C1（需要对方装了 Git）**——pnpm 会先用 `git ls-remote` 解析 tag，所以本机没有 `git` 会直接失败：
 
 ```powershell
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "github:inuyama404/dsh-session-delete#v0.2.0"
+& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "github:inuyama404/dsh-session-delete#v0.2.1"
 ```
 
 **方式 C2（不需要 Git，新机器首选）**——直接用 release 附件 URL，一步到位：
 
 ```powershell
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://github.com/inuyama404/dsh-session-delete/releases/download/v0.2.0/dsh-session-delete-0.2.0.tgz"
+& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://github.com/inuyama404/dsh-session-delete/releases/download/v0.2.1/dsh-session-delete-0.2.1.tgz"
 ```
 
 **方式 C3（不需要 Git）**——GitHub 的 tag 归档：
 
 ```powershell
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://codeload.github.com/inuyama404/dsh-session-delete/tar.gz/refs/tags/v0.2.0"
+& "D:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "https://codeload.github.com/inuyama404/dsh-session-delete/tar.gz/refs/tags/v0.2.1"
 ```
 
 **装到干净的机器上请用 C2**：一步到位，且不依赖 `git`。A 需要先拿到 tgz 文件，B 是 `link:` 安装（目录必须一直留着），C1 需要对方装了 Git（本机没有 git，实测报 `git ls-remote` 找不到命令），C3 拉的是 tag 归档而非发布附件。C2 / C3 都在一次性 profile 里实测通过（装成真实目录、bundle 自动进 `dsh.profile.bundles`、装好的副本自检 32 项全过）。本插件没有 `prepare` 或任何构建脚本，不会触发 pnpm 的构建脚本审批。
@@ -168,7 +198,7 @@ token 从 `$env:DSH_GH_TOKEN` 读取（细粒度、只授权本仓库的 Content
 ### 换机器要注意什么
 
 - **版本门槛**：插件声明 peer `@deepseek-ai/dsh-base >=0.2.0-rc.1 <0.3.0`。对方版本不在范围内时，`dsh plugin add` 会在安装前直接拒绝，并打印放行命令：
-  `dsh plugin --profile desktop allow-version dsh-session-delete@0.2.0 --dsh-version <对方运行时版本> --accept-risk`。
+  `dsh plugin --profile desktop allow-version dsh-session-delete@0.2.1 --dsh-version <对方运行时版本> --accept-risk`。
   这是官方的风险闸门（不兼容插件可能崩溃或损坏数据），放行前请确认插件的 API 在新版本里还在。对 0.1.x：`sessionPersistence.stat()` / `locate()` 可能不存在，代码里这两处都有兜底（拿不到 header 就按 `<home>/sessions/*/<会话id>` 扫描目录删除），但**未在 0.1.x 上实测**。
 - **profile 名要对**：桌面客户端装到 `--profile desktop`；若你在别处用 `dsh web` 启动，默认 profile 是 `web`，就装到 `web`。
 - **只适用于客户端/Web profile**：插件需要 `webServer`（注册路由）与 `sessionPersistence`；headless / ACP / SDK 这类没有 `webServer` 的 profile 里它会停在 `pending`，不会激活。
@@ -184,8 +214,9 @@ token 从 `$env:DSH_GH_TOKEN` 读取（细粒度、只授权本仓库的 Content
 3. **宿主半侧**（在任意 shell 里，不依赖客户端；端口以客户端实际监听为准）：
    ```powershell
    curl.exe -sS http://127.0.0.1:19387/dsh-session-delete/status
-   # {"ok":true,"plugin":"dsh-session-delete","version":"0.2.0","workspaceRegistry":true,
-   #  "bulk":{"plan":"/dsh-session-delete/plan","delete":"/dsh-session-delete/bulk-delete","maxPerRequest":200}}
+   # {"ok":true,"plugin":"dsh-session-delete","version":"0.2.1","workspaceRegistry":true,
+   #  "bulk":{"plan":"/dsh-session-delete/plan","delete":"/dsh-session-delete/bulk-delete","maxPerRequest":200},
+   #  "diagnose":"/dsh-session-delete/diagnose"}
    ```
    返回 404 说明当前进程里跑的还是 0.1.0（没有 status 路由，但删除功能正常）；`version` 会告诉你进程里到底是哪一份代码；没有 `bulk` 字段说明还是 0.1.x。
 4. **客户端控制台**（仅当你的客户端开放了开发者工具时才可用）：加载后应打印
@@ -200,12 +231,16 @@ token 从 `$env:DSH_GH_TOKEN` 读取（细粒度、只授权本仓库的 Content
 不启动 DSH 就能跑完整回归（伪装宿主 context、模块加载器与 React）：
 
 ```powershell
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\node.cmd" test/selftest.mjs
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\node.cmd" test/bulk.test.mjs
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\node.cmd" test/bulk-run.test.mjs
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\node.cmd" test/render-bar.test.mjs
-& "D:\DeepSeek Harness\resources\runtime\cli\bin\node.cmd" test/open-session.test.mjs
+$node = "$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
+& $node test/selftest.mjs
+& $node test/bulk.test.mjs
+& $node test/bulk-run.test.mjs
+& $node test/render-bar.test.mjs
+& $node test/open-session.test.mjs
+& $node test/diagnose.test.mjs
 ```
+
+> 这些套件会在 `test\` 下创建临时目录。若当前会话是 sandbox 模式（workspace-write）而 `test\` 恰好没有写授权，`mkdir` 会报 `EPERM`：把插件目录复制到可写位置再跑即可（套件按文件自身位置定位插件，复制后照样有效）。
 
 | 套件 | 覆盖 |
 |---|---|
@@ -214,6 +249,7 @@ token 从 `$env:DSH_GH_TOKEN` 读取（细粒度、只授权本仓库的 Content
 | `bulk-run` | 全部成功 → 自动关闭选择模式；部分失败 → 只留失败项；传输失败 → 保留全部可重试；**当前会话被过滤且不发请求** |
 | `render-bar` | 红色按钮的位置与文案、无选中时不渲染、确认框为 modal、取消保留勾选 |
 | `open-session` | 用假 DOM 验证当前会话判定：复选框置灰、切换后解除、卸载后释放 |
+| `diagnose` | 删完清归档标记（首次删除与已归档都覆盖）、布局挪位后仍按名字找到并删除、`locate()` 抛错时回退磁盘扫描、store 认识但盘上没有时**拒绝而非只归档**、diagnose 端点的判定与字段 |
 
 ## 卸载
 

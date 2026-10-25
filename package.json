@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-delete",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Adds Delete session and bulk delete actions to the DSH sidebar that really remove sessions from disk.",
   "type": "module",
@@ -35,6 +35,6 @@
     "@deepseek-ai/dsh-base": ">=0.2.0-rc.1 <0.3.0"
   },
   "scripts": {
-    "test": "node test/selftest.mjs && node test/bulk.test.mjs && node test/bulk-run.test.mjs && node test/render-bar.test.mjs && node test/open-session.test.mjs"
+    "test": "node test/selftest.mjs && node test/bulk.test.mjs && node test/bulk-run.test.mjs && node test/render-bar.test.mjs && node test/open-session.test.mjs && node test/diagnose.test.mjs"
   }
 }

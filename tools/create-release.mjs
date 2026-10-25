@@ -3,11 +3,19 @@
 // is needed; the binary asset goes to uploads.github.com, not the Contents API.
 //   node create-release.mjs <version> <tarballPath> <sha256>
 // Requires DSH_GH_TOKEN with Contents: Read and write.
-import { readFileSync } from 'node:fs'
+//
+// The description comes from buildReleaseBody (RELEASE_NOTES.md when present),
+// never from text baked into this file: a hard-coded body once shipped the 0.1.2
+// notes inside the 0.2.0 release.
+import { existsSync, readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import { buildReleaseBody } from './release-notes.mjs'
 
 const OWNER = 'inuyama404'
 const REPO = 'dsh-session-delete'
 const HEADERS = { 'user-agent': 'dsh-release', accept: 'application/vnd.github+json' }
+const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 const [, , version, tarballPath, sha256] = process.argv
 if (!version || !tarballPath || !sha256) {
@@ -41,29 +49,18 @@ if (existing.status === 200) {
   process.exit(4)
 }
 
-const body = [
-  `CJK 界面下会话菜单里的删除项此前一直显示英文（\`Delete session\`）。`,
-  ``,
-  `- **修**：客户端声明 \`inject: ['slots', 'locale']\`，等到 locale 服务就绪后再注册 \`zh\`/en\` 词典。此前只注入 \`slots\`，而 Cordis 4.0.4 没有可选注入、locale 服务又在一次 \`await\` 之后才 \`provide\`，第三方 bundle 有机会先跑完 \`apply\`：\`ctx.get('locale')\` 返回 \`undefined\`，词典从未注册，菜单项于是一直走内置英文兜底表。`,
-  `- **修**：语言降级不再静默——注册失败与服务缺失各留一条 \`console.warn\`，启动日志直接标明当前是 \`locale: dsh-session-delete\` 还是 \`english fallback\`。`,
-  `- 未改动的行为：locale 服务不可用时仍可用，只是回落英文（并现在会说出来）。`,
-  ``,
-  `### 安装`,
-  ``,
-  '```powershell',
-  `& "<DSH>\\resources\\runtime\\cli\\bin\\dsh.cmd" plugin --profile desktop add "https://github.com/${OWNER}/${REPO}/releases/download/${tag}/dsh-session-delete-${version}.tgz"`,
-  '```',
-  ``,
-  `### 校验`,
-  ``,
-  '```',
-  `${sha256}  dsh-session-delete-${version}.tgz`,
-  '```',
-  ``,
-  `本版只改动两个文件：\`client.js\`（修复）与 \`package.json\`（版本号）。其余文件与 0.1.1 逐字节相同。`,
-  ``,
-  `> 已发布的 0.1.1 tarball 仍含该缺陷，装过 0.1.1 的人需要升级到本版。`,
-].join('\n')
+const notesPath = process.env.RELEASE_NOTES ?? join(root, 'RELEASE_NOTES.md')
+const notes = existsSync(notesPath) ? readFileSync(notesPath, 'utf8') : null
+console.log(`notes                     : ${notes === null ? 'generated' : `${notesPath} (${notes.length} chars)`}`)
+const body = buildReleaseBody({
+  version,
+  sha256,
+  notes,
+  owner: OWNER,
+  repo: REPO,
+  tag,
+  appendSections: !process.argv.includes('--no-append'),
+})
 
 const rel = await fetch(`${API}/releases`, {
   method: 'POST',

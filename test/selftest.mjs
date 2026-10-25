@@ -214,9 +214,14 @@ async function clientTest() {
     IconTrashOutlineRegular: function IconTrashOutlineRegular(props) { return { type: 'IconTrashOutlineRegular', props } },
   }
 
+  const hiddenStyles = []
   const sandbox = {
     console,
     window: { __ModuleLoader__: { load: (spec) => { sandbox.__captured = spec } } },
+    document: {
+      head: { appendChild: (tag) => { hiddenStyles.push(tag) } },
+      createElement: () => ({ dataset: {}, textContent: '' }),
+    },
     fetch: async (url, init) => {
       requests.push({ url, body: JSON.parse(init.body) })
       return { ok: true, status: 200, async json() { return { ok: true, removed: ['x'] } } }
@@ -239,12 +244,34 @@ async function clientTest() {
   const registrations = []
   const provided = new Map()
   const dictionaries = []
+  let listRefreshes = 0
+  const clientList = {
+    ids: [SESSION_ID, 'session-ffff0000-0000-0000-0000-00000000dead'],
+    byId: {
+      [SESSION_ID]: { id: SESSION_ID, title: 'kept', blank: false, origin: 'user' },
+      'session-ffff0000-0000-0000-0000-00000000dead': { id: 'session-ffff0000-0000-0000-0000-00000000dead', title: 'stray', blank: false, origin: 'user' },
+    },
+  }
   const ctx = {
     effect(callback) { const dispose = callback(); return () => { if (typeof dispose === 'function') dispose() } },
-    // A locale service is present, so every surface must be given its seat.
-    get: (name) => (name === 'locale'
-      ? { register: (ns, dicts) => { dictionaries.push({ ns, dicts }); return () => {} } }
-      : undefined),
+    // A locale service is present, so every surface must be given its seat; the
+    // session service is the list baseline a delete has to re-pull.
+    get: (name) => {
+      if (name === 'locale') return { register: (ns, dicts) => { dictionaries.push({ ns, dicts }); return () => {} } }
+      if (name === 'sessions') return { refresh: async () => { listRefreshes += 1 }, list: { getSnapshot: () => clientList } }
+      if (name === 'workspaces') {
+        return {
+          list: {
+            getSnapshot: () => ({
+              items: [{ workspaceId: 'ws-1', title: 'default-workspace', sessionIds: [SESSION_ID] }],
+              archivedSessionIds: [],
+              pinnedSessionIds: [],
+            }),
+          },
+        }
+      }
+      return undefined
+    },
     provide(name, value) { provided.set(name, value) },
     slots: {
       inject(name, register) {
@@ -265,6 +292,9 @@ async function clientTest() {
     },
   }
   plugin.apply(ctx)
+  // Mounting reconciles the list once, so a stale row cannot survive a reload.
+  const refreshesAtMount = listRefreshes
+  check('refreshes the list on mount', refreshesAtMount === 1, String(refreshesAtMount))
   check('publishes the selection service', provided.has('sessionDeleteSelection'), String(provided.has('sessionDeleteSelection')))
   check('registers every surface', registrations.length === 5, String(registrations.length))
   check(
@@ -299,8 +329,32 @@ async function clientTest() {
   await tree.props.onSelect()
   await new Promise((resolve) => setTimeout(resolve, 0))
   check('confirmation calls the host once', edits.length === 1 && edits[0] === SESSION_ID, JSON.stringify(edits))
-  check('confirmation posts to the plugin route', requests[0]?.url === '/dsh-session-delete/delete', String(requests[0]?.url))
+  const deleteCall = requests.find((request) => request.url === '/dsh-session-delete/delete')
+  check('confirmation posts to the plugin route', deleteCall !== undefined, JSON.stringify(requests.map((r) => r.url)))
   check('success closes the menu', menus.includes(false), JSON.stringify(menus))
+  // The row must leave the page even when the host had no file to unlink (a
+  // session that was never materialized): the rule targets its row key exactly.
+  check(
+    'hides the deleted row',
+    hiddenStyles.length === 1
+      && hiddenStyles[0]?.textContent === `[data-row-key="session:${SESSION_ID}"]{display:none !important}`,
+    JSON.stringify(hiddenStyles.map((tag) => tag.textContent)),
+  )
+  // ...and the client's own list has to re-pull, or the stale row comes back as an
+  // "Ungrouped" row (or an empty Ungrouped group) on the next render.
+  check('re-pulls the session list', listRefreshes === refreshesAtMount + 1, `${refreshesAtMount} → ${listRefreshes}`)
+  // The report names what this page holds, so a stray row can be identified from
+  // the Host side without asking the user to read a console.
+  const report = requests.filter((request) => request.url === '/dsh-session-delete/report').at(-1)
+  check(
+    'reports the client list to the host',
+    report !== undefined
+      && report.body?.reason === 'delete'
+      && Array.isArray(report.body?.ids)
+      && report.body.ids.includes('session-ffff0000-0000-0000-0000-00000000dead')
+      && report.body?.workspaces?.[0]?.sessionIds?.includes(SESSION_ID),
+    JSON.stringify(report?.body?.ids),
+  )
   runtime.begin()
   tree = Component(props)
   check('success state renders Deleted', String(tree.props.children) === 'Deleted', String(tree.props.children))

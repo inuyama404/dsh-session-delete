@@ -132,7 +132,10 @@ await test('the open session stays out of the batch even if it was selected', as
   store.toggle(A)
   store.begin()
   let called = 0
-  globalThis.fetch = async (_url, init) => {
+  globalThis.fetch = async (url, init) => {
+    // The client also reports its state to the plugin's diagnostic route; only the
+    // batch request is under test here.
+    if (url !== '/dsh-session-delete/bulk-delete') return { ok: true, status: 200, json: async () => ({ ok: true }) }
     called += 1
     const body = JSON.parse(init.body)
     assert.deepEqual(body.sessionIds, [B], 'the request must not contain the open session')
